@@ -33,7 +33,7 @@ const target = join(triggerHome, "src", "server.mjs");
 
 if (!existsSync(target)) {
   console.error(`[apr-trigger wrapper] target missing: ${target}`);
-  console.error("Set APR_TRIGGER_HOME to the apr-trigger repo root.");
+  console.error("Set APR_TRIGGER_HOME to the apr-control-plane repo root.");
   process.exit(1);
 }
 
