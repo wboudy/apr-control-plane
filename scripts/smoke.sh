@@ -82,6 +82,14 @@ curl -sS -X POST "http://127.0.0.1:$PORT/plan" \
   > "$PLAN_JSON"
 
 jq -e '.ok == true and (.run_id|length>0) and (.artifacts_path|length>0)' "$PLAN_JSON" >/dev/null
+RUN_ID="$(jq -r '.run_id' "$PLAN_JSON")"
+RUN_JSON="$TMP_DIR/run.json"
+curl -sS "http://127.0.0.1:$PORT/runs/$RUN_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  > "$RUN_JSON"
+jq -e --arg run_id "$RUN_ID" \
+  '.ok == true and .run_id == $run_id and (.state == "done" or .state == "failed")' \
+  "$RUN_JSON" >/dev/null
 ART_PATH="$(jq -r '.artifacts_path' "$PLAN_JSON")"
 for f in request.json effective_config.json oracle_cmd.json oracle_stdout.txt oracle_stderr.txt response.json meta.json plan.md; do
   test -f "$ART_PATH/$f"

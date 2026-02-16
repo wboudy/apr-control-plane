@@ -115,3 +115,13 @@ bash scripts/smoke.sh
 ## Operations
 
 See `docs/OPERATIONS.md` and `docs/APR_TRIGGER_HARDENING_PLAN.md`.
+
+## Planning Handoffs (for GPT/Codex)
+
+If you are splitting hardening work across multiple fresh agents, use:
+
+- `docs/HANDOFF_PROMPTS.md`
+
+This includes a master coordinator prompt plus separate section prompts
+for deterministic oracle invocation, preflight, policy/thinking,
+concurrency/atomicity, auditability, and observability.
