@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PORT="${SMOKE_PORT:-19444}"
+PORT="${SMOKE_PORT:-$((20000 + RANDOM % 20000))}"
 TOKEN="${SMOKE_TOKEN:-smoke-token}"
 TMP_DIR="$(mktemp -d -t apr-trigger-smoke-XXXXXX)"
 WORKSPACE="$TMP_DIR/workspace"
