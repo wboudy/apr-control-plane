@@ -25,9 +25,44 @@ import {
   writeFileSync,
 } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { parseAllowedTuples, resolveEngineModelPolicy } from "./lib/policy.mjs";
+import {
+  buildOracleArgv,
+  runOracleInvocation,
+} from "./lib/oracle.mjs";
+import {
+  errorCodeOf,
+  errorMessageOf,
+  errorResult,
+  errorRetryableOf,
+  normalizeRequestId,
+  successResult,
+} from "./lib/envelope.mjs";
+import {
+  E_INTERNAL,
+  E_LOCK_CONTENDED,
+  E_ORACLE_EXIT_NONZERO,
+  E_ORACLE_NOT_FOUND,
+  E_ORACLE_TIMEOUT,
+  E_POLICY_DISALLOWED_TUPLE,
+  E_POLICY_NO_AUTO_IN_STRICT,
+  E_PREFLIGHT_FAILED,
+} from "./lib/errors.mjs";
+import { assertRunState, isAllowedRunState } from "./lib/run-state.mjs";
 
 const SERVICE_NAME = "apr-trigger";
 const SERVICE_VERSION = "2.1.0";
+const SERVICE_STARTED_AT_MS = Date.now();
+const REQUIRED_RUN_ARTIFACTS = Object.freeze([
+  "meta.json",
+  "request.json",
+  "effective_config.json",
+  "oracle_cmd.json",
+  "stdout.log",
+  "stderr.log",
+]);
+const SENSITIVE_KEY_RE =
+  /(?:^|[_-])(authorization|token|tokens|cookie|cookies|secret|secrets|api[_-]?key|password|passwd)(?:$|[_-])/i;
 
 function envBool(name, fallback) {
   const raw = process.env[name];
@@ -75,11 +110,61 @@ function slugify(value, maxLen = 64) {
 }
 
 function redactSecrets(text) {
-  if (!text) return "";
+  if (text == null) return "";
   return String(text)
-    .replace(/Authorization:\s*Bearer\s+[^\s\n]+/gi, "Authorization: Bearer <<REDACTED>>")
+    .replace(/Authorization:\s*Bearer\s+[^\s\n]+/gi, "<<REDACTED:AUTHORIZATION_HEADER>>")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b/g, "Bearer <<REDACTED>>")
+    .replace(/\b(Cookie|Set-Cookie)\s*:\s*[^\n]+/gi, "<<REDACTED:COOKIE_HEADER>>")
+    .replace(
+      /([?&](?:access_token|id_token|token|tokens|api[_-]?key|secret|secrets|cookie|cookies|authorization)=)([^&\s]+)/gi,
+      "$1<<REDACTED>>",
+    )
+    .replace(
+      /\b((?:access_)?token|id_token|api[_-]?key|secret|secrets|cookie|cookies|authorization)\b(\s*[:=]\s*)([^,\s;]+)/gi,
+      "$1$2<<REDACTED>>",
+    )
+    .replace(
+      /("(?:access_token|id_token|token|tokens|api[_-]?key|secret|secrets|cookie|cookies|authorization)"\s*:\s*)"[^"]*"/gi,
+      '$1"<<REDACTED>>"',
+    )
     .replace(/\bsk-[A-Za-z0-9_-]{10,}\b/g, "<<REDACTED:OPENAI_KEY>>")
     .replace(/\bghp_[A-Za-z0-9]{10,}\b/g, "<<REDACTED:GITHUB_TOKEN>>");
+}
+
+function isSensitiveKey(key) {
+  return SENSITIVE_KEY_RE.test(String(key || ""));
+}
+
+function redactForPersistence(value, keyHint = "") {
+  if (value == null) return value;
+
+  if (typeof value === "string") {
+    if (isSensitiveKey(keyHint)) return "<<REDACTED>>";
+    return redactSecrets(value);
+  }
+
+  if (typeof value === "number" || typeof value === "boolean") {
+    if (isSensitiveKey(keyHint)) return "<<REDACTED>>";
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => redactForPersistence(item, keyHint));
+  }
+
+  if (typeof value === "object") {
+    const out = {};
+    for (const [key, nested] of Object.entries(value)) {
+      if (isSensitiveKey(key)) {
+        out[key] = "<<REDACTED>>";
+      } else {
+        out[key] = redactForPersistence(nested, key);
+      }
+    }
+    return out;
+  }
+
+  return value;
 }
 
 function checkAuth(req, token) {
@@ -113,18 +198,9 @@ function jsonResponse(res, status, body) {
   res.end(JSON.stringify(body, null, 2));
 }
 
-function errorResult(status, code, message, extras = {}) {
-  return {
-    status,
-    body: {
-      ok: false,
-      code,
-      error: message,
-      message,
-      retryable: Boolean(extras.retryable),
-      ...extras,
-    },
-  };
+function textResponse(res, status, body, contentType = "text/plain; charset=utf-8") {
+  res.writeHead(status, { "Content-Type": contentType });
+  res.end(body);
 }
 
 function ensureDir(path, mode = 0o700) {
@@ -158,6 +234,19 @@ function writeFileAtomic(path, content, mode = 0o600) {
     chmodSync(path, mode);
   } catch {
     // Best effort only.
+  }
+}
+
+function writeRedactedJsonArtifact(path, value) {
+  const redacted = redactForPersistence(value);
+  writeFileAtomic(path, `${JSON.stringify(redacted, null, 2)}\n`);
+}
+
+function assertRequiredArtifacts(path) {
+  for (const fileName of REQUIRED_RUN_ARTIFACTS) {
+    if (!existsSync(join(path, fileName))) {
+      throw new Error(`Missing required artifact: ${fileName}`);
+    }
   }
 }
 
@@ -196,15 +285,29 @@ function findInPath(binName, pathValue = RUNTIME_PATH) {
   return null;
 }
 
+const STRICT_MODE = envBool("APR_STRICT", true);
+const ENGINE_TARGET_RAW = process.env.APR_ENGINE_TARGET;
+const MODEL_TARGET_RAW = process.env.APR_MODEL_TARGET;
+const ENGINE_TARGET_EXPLICIT = ENGINE_TARGET_RAW != null && String(ENGINE_TARGET_RAW).trim() !== "";
+const MODEL_TARGET_EXPLICIT = MODEL_TARGET_RAW != null && String(MODEL_TARGET_RAW).trim() !== "";
+const ENGINE_TARGET = ENGINE_TARGET_EXPLICIT ? String(ENGINE_TARGET_RAW).trim() : "auto";
+const MODEL_TARGET = MODEL_TARGET_EXPLICIT ? String(MODEL_TARGET_RAW).trim() : "auto";
+const ALLOWED_TUPLES = parseAllowedTuples(process.env.APR_ALLOWED_TUPLES);
+const ALLOW_TUPLE_FALLBACK = envBool("APR_ALLOW_TUPLE_FALLBACK", !STRICT_MODE);
+
 const CONFIG = {
   port: envInt("PORT", 9444, 1),
   token: process.env.APR_TOKEN || "Zayy8714",
   hardeningV2: envBool("APR_HARDENING_V2", true),
-  strict: envBool("APR_STRICT", true),
+  strict: STRICT_MODE,
   saveArtifacts: envBool("APR_SAVE_ARTIFACTS", true),
   allowNoArtifacts: envBool("APR_ALLOW_NO_ARTIFACTS", false),
-  engineTarget: process.env.APR_ENGINE_TARGET || "browser",
-  modelTarget: process.env.APR_MODEL_TARGET || "gpt-5.2-pro",
+  engineTarget: ENGINE_TARGET,
+  modelTarget: MODEL_TARGET,
+  engineTargetExplicit: ENGINE_TARGET_EXPLICIT,
+  modelTargetExplicit: MODEL_TARGET_EXPLICIT,
+  allowTupleFallback: ALLOW_TUPLE_FALLBACK,
+  allowedTuples: ALLOWED_TUPLES,
   thinkingPolicy: process.env.APR_THINKING_POLICY || "extended",
   allowUnverifiableThinking: envBool("APR_ALLOW_UNVERIFIABLE_THINKING", false),
   oraclePath: expandHome(process.env.APR_ORACLE_PATH || "") || "",
@@ -229,6 +332,7 @@ const CONFIG = {
 const LOCK_STALE_MS = Math.max(CONFIG.oracleTimeoutMs + 5 * 60 * 1000, 30 * 60 * 1000);
 const MAX_ROUND = 100;
 const BASE_ENV = { PATH: RUNTIME_PATH, HOME: homedir(), TERM: "dumb", NO_COLOR: "1" };
+const RUN_DURATION_BUCKETS_MS = [250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 60_000, 120_000, 300_000];
 
 const ORACLE_ENV_ALLOWLIST = new Set([
   "HOME",
@@ -255,6 +359,19 @@ const state = {
     failed: 0,
     byCode: {},
     recent: [],
+    plan_requests_total: {
+      success: 0,
+      error: 0,
+      by_error_code: {},
+    },
+    run_duration_ms: {
+      buckets: [...RUN_DURATION_BUCKETS_MS],
+      counts: RUN_DURATION_BUCKETS_MS.map(() => 0),
+      count: 0,
+      sum: 0,
+    },
+    lock_contention_total: 0,
+    oracle_timeouts_total: 0,
   },
   preflightCache: {
     atMs: 0,
@@ -262,13 +379,19 @@ const state = {
   },
 };
 
-function logEvent(phase, fields = {}) {
-  const payload = {
-    ts: isoNow(),
-    service: SERVICE_NAME,
-    phase,
-    ...fields,
-  };
+function normalizeLogDimension(value) {
+  if (value == null) return null;
+  const text = String(value).trim();
+  return text ? text : null;
+}
+
+function logEvent(event, fields = {}) {
+  const payload = { ts: isoNow(), service: SERVICE_NAME, event, ...fields };
+  payload.request_id = normalizeLogDimension(payload.request_id);
+  payload.run_id = normalizeLogDimension(payload.run_id);
+  payload.workspace = normalizeLogDimension(payload.workspace);
+  payload.project = normalizeLogDimension(payload.project);
+  payload.duration_ms = Number.isFinite(payload.duration_ms) ? Math.max(0, Math.round(payload.duration_ms)) : null;
   console.log(JSON.stringify(payload));
 }
 
@@ -282,6 +405,91 @@ function safePushRecent(entry) {
 function incrementErrorCode(code) {
   const current = state.metrics.byCode[code] || 0;
   state.metrics.byCode[code] = current + 1;
+}
+
+function incrementPlanRequestsTotal(result, errorCode = null) {
+  if (result === "success") {
+    state.metrics.plan_requests_total.success += 1;
+    return;
+  }
+  state.metrics.plan_requests_total.error += 1;
+  if (errorCode) {
+    const current = state.metrics.plan_requests_total.by_error_code[errorCode] || 0;
+    state.metrics.plan_requests_total.by_error_code[errorCode] = current + 1;
+  }
+}
+
+function observeRunDuration(durationMs) {
+  if (!Number.isFinite(durationMs) || durationMs < 0) return;
+  const histogram = state.metrics.run_duration_ms;
+  histogram.count += 1;
+  histogram.sum += durationMs;
+  for (let i = 0; i < histogram.buckets.length; i += 1) {
+    if (durationMs <= histogram.buckets[i]) {
+      histogram.counts[i] += 1;
+      break;
+    }
+  }
+}
+
+function operationalMetricsSnapshot() {
+  const histogram = state.metrics.run_duration_ms;
+  return {
+    plan_requests_total: {
+      success: state.metrics.plan_requests_total.success,
+      error: state.metrics.plan_requests_total.error,
+      by_error_code: state.metrics.plan_requests_total.by_error_code,
+    },
+    run_duration_ms: {
+      buckets: histogram.buckets.map((le, idx) => ({ le, count: histogram.counts[idx] })),
+      count: histogram.count,
+      sum: histogram.sum,
+    },
+    lock_contention_total: state.metrics.lock_contention_total,
+    oracle_timeouts_total: state.metrics.oracle_timeouts_total,
+  };
+}
+
+function escapePromLabel(value) {
+  return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+}
+
+function formatPrometheusMetrics() {
+  const lines = [];
+  lines.push("# HELP plan_requests_total Total count of POST /plan requests grouped by result and error code.");
+  lines.push("# TYPE plan_requests_total counter");
+  lines.push(`plan_requests_total{result="success"} ${state.metrics.plan_requests_total.success}`);
+  lines.push(`plan_requests_total{result="error"} ${state.metrics.plan_requests_total.error}`);
+  for (const [errorCode, count] of Object.entries(state.metrics.plan_requests_total.by_error_code)) {
+    lines.push(
+      `plan_requests_total{result="error",error_code="${escapePromLabel(errorCode)}"} ${count}`,
+    );
+  }
+  lines.push("");
+
+  lines.push("# HELP run_duration_ms End-to-end duration of plan runs in milliseconds.");
+  lines.push("# TYPE run_duration_ms histogram");
+  const histogram = state.metrics.run_duration_ms;
+  let cumulative = 0;
+  for (let i = 0; i < histogram.buckets.length; i += 1) {
+    cumulative += histogram.counts[i];
+    lines.push(`run_duration_ms_bucket{le="${histogram.buckets[i]}"} ${cumulative}`);
+  }
+  lines.push(`run_duration_ms_bucket{le="+Inf"} ${histogram.count}`);
+  lines.push(`run_duration_ms_sum ${histogram.sum}`);
+  lines.push(`run_duration_ms_count ${histogram.count}`);
+  lines.push("");
+
+  lines.push("# HELP lock_contention_total Count of lock acquisition failures due to contention.");
+  lines.push("# TYPE lock_contention_total counter");
+  lines.push(`lock_contention_total ${state.metrics.lock_contention_total}`);
+  lines.push("");
+
+  lines.push("# HELP oracle_timeouts_total Count of oracle executions terminated due to timeout.");
+  lines.push("# TYPE oracle_timeouts_total counter");
+  lines.push(`oracle_timeouts_total ${state.metrics.oracle_timeouts_total}`);
+
+  return `${lines.join("\n")}\n`;
 }
 
 function bootstrapWorkspaceMap() {
@@ -321,23 +529,17 @@ function workspaceForAgent(agent, workspaceMap) {
 }
 
 function resolveOracleInvocation() {
-  const configured = CONFIG.oraclePath ? resolve(expandHome(CONFIG.oraclePath)) : "";
-  if (configured) {
-    if (!isAbsolute(configured)) return null;
+  const configuredRaw = CONFIG.oraclePath ? expandHome(CONFIG.oraclePath) : "";
+  if (configuredRaw) {
+    if (!isAbsolute(configuredRaw)) return null;
+    const configured = resolve(configuredRaw);
     if (!isExecutable(configured)) return null;
-    return { command: configured, prefixArgs: [], source: "configured" };
+    return { command: configured, source: "configured" };
   }
 
   const oracleBin = findInPath("oracle");
-  if (oracleBin) {
-    return { command: oracleBin, prefixArgs: [], source: "path" };
-  }
-
-  if (CONFIG.strict) return null;
-
-  const npxBin = findInPath("npx");
-  if (npxBin) {
-    return { command: npxBin, prefixArgs: ["-y", "@steipete/oracle"], source: "npx" };
+  if (oracleBin && isAbsolute(oracleBin)) {
+    return { command: oracleBin, source: "path" };
   }
 
   return null;
@@ -357,7 +559,7 @@ function buildOracleEnv(oracleCommandPath) {
 
 function probeOracleVersion(invocation, timeoutMs = 15_000) {
   return new Promise((resolveProbe) => {
-    const proc = spawn(invocation.command, [...invocation.prefixArgs, "--version"], {
+    const proc = spawn(invocation.command, ["--version"], {
       shell: false,
       env: buildOracleEnv(invocation.command),
       timeout: timeoutMs,
@@ -405,16 +607,55 @@ function freeBytesForPath(path) {
 }
 
 async function runPreflightChecks() {
-  const errors = [];
+  const startedAt = Date.now();
+  const fatalErrors = [];
+  const warnings = [];
   const invocation = resolveOracleInvocation();
+  const policyDecision = resolveEngineModelPolicy({
+    strict: CONFIG.strict,
+    engine: CONFIG.engineTarget,
+    model: CONFIG.modelTarget,
+    engineExplicit: CONFIG.engineTargetExplicit,
+    modelExplicit: CONFIG.modelTargetExplicit,
+    allowFallback: CONFIG.allowTupleFallback,
+    allowedTuples: CONFIG.allowedTuples,
+  });
+  const checks = {
+    oracle_path: {
+      fatal: true,
+      ok: false,
+      configured_path: CONFIG.oraclePath ? resolve(expandHome(CONFIG.oraclePath)) : null,
+      resolved_path: invocation ? invocation.command : null,
+      source: invocation ? invocation.source : null,
+      message: null,
+    },
+    artifacts_dir: {
+      fatal: true,
+      ok: false,
+      path: artifactStoreRoot(),
+      message: null,
+    },
+    lock_dir: {
+      fatal: true,
+      ok: false,
+      path: CONFIG.lockDir,
+      message: null,
+    },
+  };
   const result = {
     ok: true,
-    errors,
+    state: "OK",
+    checked_at: isoNow(),
+    errors: fatalErrors,
+    fatal_errors: fatalErrors,
+    warnings,
+    checks,
     oracle: {
       available: false,
       path: invocation ? invocation.command : null,
       version: null,
       source: invocation ? invocation.source : null,
+      error_code: null,
     },
     routing: {
       workspace_map_file: CONFIG.workspaceMapFile,
@@ -433,19 +674,32 @@ async function runPreflightChecks() {
       active: state.activeRuns.size,
       depth: 0,
     },
+    policy: {
+      ok: policyDecision.ok,
+      code: policyDecision.code,
+      requested: policyDecision.requested,
+      effective: policyDecision.effective,
+      fallback_applied: policyDecision.fallback_applied,
+      allowed_tuples: policyDecision.allowed_tuples,
+    },
   };
 
   if (!invocation) {
-    errors.push("Oracle CLI invocation could not be resolved");
+    result.oracle.error_code = E_ORACLE_NOT_FOUND;
+    const msg = "Oracle path is invalid or not executable";
+    checks.oracle_path.message = msg;
+    fatalErrors.push(msg);
   } else {
+    checks.oracle_path.ok = true;
     const probe = await probeOracleVersion(invocation);
     if (!probe.ok) {
-      errors.push(`Oracle version probe failed: ${probe.raw || `exit ${String(probe.code)}`}`);
+      result.oracle.error_code = E_ORACLE_EXIT_NONZERO;
+      warnings.push(`Oracle version probe failed: ${probe.raw || `exit ${String(probe.code)}`}`);
     } else {
       result.oracle.available = true;
       result.oracle.version = probe.version;
       if (CONFIG.oracleVersionExpected && probe.version !== CONFIG.oracleVersionExpected) {
-        errors.push(
+        warnings.push(
           `Oracle version mismatch: expected ${CONFIG.oracleVersionExpected}, got ${probe.version}`,
         );
       }
@@ -454,15 +708,21 @@ async function runPreflightChecks() {
 
   try {
     assertWritableDir(CONFIG.lockDir);
+    checks.lock_dir.ok = true;
   } catch (err) {
-    errors.push(`Lock dir not writable: ${String(err.message || err)}`);
+    const msg = `Lock dir not writable: ${String(err.message || err)}`;
+    checks.lock_dir.message = msg;
+    fatalErrors.push(msg);
   }
 
   try {
     assertWritableDir(artifactStoreRoot());
+    checks.artifacts_dir.ok = true;
     result.artifact_store.writable = true;
   } catch (err) {
-    errors.push(`Artifact store not writable: ${String(err.message || err)}`);
+    const msg = `Artifact store not writable: ${String(err.message || err)}`;
+    checks.artifacts_dir.message = msg;
+    fatalErrors.push(msg);
   }
 
   result.artifact_store.free_bytes = freeBytesForPath(artifactStoreRoot());
@@ -471,26 +731,42 @@ async function runPreflightChecks() {
     const map = loadWorkspaceMap();
     const keys = Object.keys(map);
     if (keys.length === 0) {
-      errors.push("Workspace map is empty");
+      warnings.push("Workspace map is empty");
     }
     result.routing.map_loaded = true;
   } catch (err) {
-    errors.push(`Workspace map load failed: ${String(err.message || err)}`);
+    warnings.push(`Workspace map load failed: ${String(err.message || err)}`);
   }
 
-  if (CONFIG.strict) {
-    if (CONFIG.engineTarget === "auto") {
-      errors.push("Strict mode forbids APR_ENGINE_TARGET=auto");
-    }
-    if (CONFIG.modelTarget === "auto") {
-      errors.push("Strict mode forbids APR_MODEL_TARGET=auto");
-    }
-    if (invocation && !isAbsolute(invocation.command)) {
-      errors.push("Strict mode requires absolute Oracle command path");
-    }
+  if (!policyDecision.ok) {
+    warnings.push(`${policyDecision.code}: ${policyDecision.reason}`);
   }
 
-  result.ok = errors.length === 0;
+  if (CONFIG.strict && invocation && !isAbsolute(invocation.command)) {
+    warnings.push("Strict mode requires absolute Oracle command path");
+  }
+
+  if (fatalErrors.length > 0) {
+    result.state = "FAIL";
+    result.ok = false;
+  } else if (warnings.length > 0) {
+    result.state = "DEGRADED";
+    result.ok = true;
+  } else {
+    result.state = "OK";
+    result.ok = true;
+  }
+
+  logEvent(result.ok ? "preflight.ok" : "preflight.fail", {
+    request_id: null,
+    run_id: null,
+    workspace: null,
+    project: null,
+    duration_ms: Date.now() - startedAt,
+    state: result.state,
+    fatal_errors: fatalErrors,
+    warnings,
+  });
   return result;
 }
 
@@ -658,16 +934,17 @@ function loadRequestCache() {
 }
 
 function persistRequestCache(requestId, runId, status, responseBody) {
+  const persistedResponse = redactForPersistence(responseBody);
   const record = {
     request_id: requestId,
     run_id: runId,
     http_status: status,
-    response: responseBody,
+    response: persistedResponse,
     saved_at: isoNow(),
   };
   state.requestCache.set(requestId, {
     http_status: status,
-    response: responseBody,
+    response: persistedResponse,
     run_id: runId,
     saved_at: record.saved_at,
   });
@@ -679,13 +956,28 @@ function makeRunId() {
 }
 
 function updateRunStore(runId, patch) {
+  if ("state" in patch) {
+    assertRunState(patch.state);
+  }
   const existing = state.runStore.get(runId) || {};
   state.runStore.set(runId, { ...existing, ...patch });
 }
 
-function buildThinkingVerifiability(preflight) {
-  const hasPinnedModel = CONFIG.modelTarget && CONFIG.modelTarget !== "auto";
-  const hasPinnedEngine = CONFIG.engineTarget && CONFIG.engineTarget !== "auto";
+function resolvePolicyDecision() {
+  return resolveEngineModelPolicy({
+    strict: CONFIG.strict,
+    engine: CONFIG.engineTarget,
+    model: CONFIG.modelTarget,
+    engineExplicit: CONFIG.engineTargetExplicit,
+    modelExplicit: CONFIG.modelTargetExplicit,
+    allowFallback: CONFIG.allowTupleFallback,
+    allowedTuples: CONFIG.allowedTuples,
+  });
+}
+
+function buildThinkingVerifiability(preflight, effectiveEngine, effectiveModel) {
+  const hasPinnedModel = effectiveModel && effectiveModel !== "auto";
+  const hasPinnedEngine = effectiveEngine && effectiveEngine !== "auto";
   const versionPinned = !CONFIG.oracleVersionExpected || preflight.oracle.version === CONFIG.oracleVersionExpected;
   if (hasPinnedModel && hasPinnedEngine && versionPinned) {
     return "INFERRED";
@@ -762,73 +1054,18 @@ Now create the implementation plan.
 `;
 }
 
-function runOracle({ prompt, workspacePath, invocation }) {
-  return new Promise((resolveRun) => {
-    const args = [
-      ...invocation.prefixArgs,
-      "--prompt",
+function runOracle({ runId, prompt, workspacePath, invocation, effectiveEngine, effectiveModel }) {
+  return runOracleInvocation({
+    runId,
+    argv: buildOracleArgv({
+      oraclePath: invocation.command,
       prompt,
-      "--model",
-      CONFIG.modelTarget,
-      "--engine",
-      CONFIG.engineTarget,
-      "--wait",
-    ];
-
-    const proc = spawn(invocation.command, args, {
-      shell: false,
-      cwd: workspacePath,
-      env: buildOracleEnv(invocation.command),
-    });
-
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-
-    const timeoutHandle = setTimeout(() => {
-      timedOut = true;
-      try {
-        proc.kill("SIGKILL");
-      } catch {
-        // Best effort.
-      }
-    }, CONFIG.oracleTimeoutMs);
-
-    proc.stdout.on("data", (d) => {
-      stdout += d.toString();
-    });
-
-    proc.stderr.on("data", (d) => {
-      stderr += d.toString();
-    });
-
-    proc.on("close", (code, signal) => {
-      clearTimeout(timeoutHandle);
-      resolveRun({
-        ok: !timedOut && code === 0,
-        code,
-        signal,
-        timedOut,
-        stdout: stdout.trim(),
-        stderr: stderr.trim(),
-        command: invocation.command,
-        args,
-      });
-    });
-
-    proc.on("error", (err) => {
-      clearTimeout(timeoutHandle);
-      resolveRun({
-        ok: false,
-        code: -1,
-        signal: null,
-        timedOut,
-        stdout: stdout.trim(),
-        stderr: err.message,
-        command: invocation.command,
-        args,
-      });
-    });
+      model: effectiveModel,
+      engine: effectiveEngine,
+    }),
+    cwd: workspacePath,
+    env: buildOracleEnv(invocation.command),
+    timeoutMs: CONFIG.oracleTimeoutMs,
   });
 }
 
@@ -878,11 +1115,18 @@ function buildRunPaths(workspacePath, projectSlug, runId) {
 }
 
 function serviceStatusBody(preflight) {
+  const uptimeMs = Math.max(0, Date.now() - SERVICE_STARTED_AT_MS);
   return {
     ok: preflight.ok,
-    status: preflight.ok ? "ok" : "fail",
+    state: preflight.state,
     service: SERVICE_NAME,
     version: SERVICE_VERSION,
+    uptime_ms: uptimeMs,
+    active_run_count: state.activeRuns.size,
+    build: {
+      version: SERVICE_VERSION,
+      sha: process.env.APR_BUILD_SHA || "unknown",
+    },
     oracle: preflight.oracle,
     defaults: {
       strict: CONFIG.strict,
@@ -900,7 +1144,11 @@ function serviceStatusBody(preflight) {
     artifact_store: preflight.artifact_store,
     preflight: {
       ok: preflight.ok,
-      errors: preflight.errors,
+      state: preflight.state,
+      checked_at: preflight.checked_at,
+      checks: preflight.checks,
+      fatal_errors: preflight.fatal_errors,
+      warnings: preflight.warnings,
     },
     metrics: {
       total: state.metrics.total,
@@ -908,39 +1156,46 @@ function serviceStatusBody(preflight) {
       failed: state.metrics.failed,
       by_code: state.metrics.byCode,
       recent: state.metrics.recent.slice(-20),
-    },
-    build: {
-      version: SERVICE_VERSION,
-      sha: process.env.APR_BUILD_SHA || "unknown",
+      operational: operationalMetricsSnapshot(),
     },
   };
 }
 
 async function handlePlan(body) {
   const startedAt = Date.now();
-  const requestId =
+  const providedRequestId =
     typeof body.request_id === "string" && body.request_id.trim()
-      ? body.request_id.trim().slice(0, 128)
-      : undefined;
+      ? normalizeRequestId(body.request_id)
+      : null;
+  const canonicalRequestId = providedRequestId || normalizeRequestId();
+  const runId = makeRunId();
 
-  if (requestId && state.requestInFlight.has(requestId)) {
-    const inFlightRunId = state.requestInFlight.get(requestId);
-    return errorResult(409, "REQUEST_ID_IN_FLIGHT", "request_id is already running", {
-      retryable: true,
-      run_id: inFlightRunId,
-      request_id: requestId,
-    });
+  const finalizePlanResult = (result) => {
+    const ok = Boolean(result?.body?.ok);
+    incrementPlanRequestsTotal(ok ? "success" : "error", ok ? null : errorCodeOf(result?.body) || E_INTERNAL);
+    return result;
+  };
+
+  if (providedRequestId && state.requestInFlight.has(providedRequestId)) {
+    const inFlightRunId = state.requestInFlight.get(providedRequestId);
+    return finalizePlanResult(
+      errorResult(409, E_LOCK_CONTENDED, "request_id is already running", {
+        request_id: canonicalRequestId,
+        retryable: true,
+        details: {
+          run_id: inFlightRunId,
+          reason: "request_id_in_flight",
+        },
+      }),
+    );
   }
 
-  if (requestId && state.requestCache.has(requestId)) {
-    const cached = state.requestCache.get(requestId);
-    return {
+  if (providedRequestId && state.requestCache.has(providedRequestId)) {
+    const cached = state.requestCache.get(providedRequestId);
+    return finalizePlanResult({
       status: cached.http_status,
-      body: {
-        ...cached.response,
-        replayed: true,
-      },
-    };
+      body: cached.response.ok ? { ...cached.response, replayed: true } : cached.response,
+    });
   }
 
   const project = typeof body.project === "string" ? body.project.trim() : "";
@@ -950,41 +1205,76 @@ async function handlePlan(body) {
     typeof body.agent === "string" && body.agent.trim()
       ? slugify(body.agent, 80)
       : slugify(CONFIG.defaultAgent, 80);
+  const failPlan = (status, code, message, details = {}, workspace = null, retryable = false) => {
+    const durationMs = Date.now() - startedAt;
+    observeRunDuration(durationMs);
+    const result = errorResult(status, code, message, {
+      request_id: canonicalRequestId,
+      retryable,
+      details: { run_id: runId, ...details },
+    });
+    logEvent("run.failed", {
+      request_id: canonicalRequestId,
+      run_id: runId,
+      workspace,
+      project: project || null,
+      duration_ms: durationMs,
+      code,
+      http_status: status,
+    });
+    return finalizePlanResult(result);
+  };
 
   if (!project) {
-    return errorResult(400, "REQUEST_INVALID", "Missing or invalid 'project' field", {
-      request_id: requestId,
-    });
+    return failPlan(400, E_INTERNAL, "Missing or invalid 'project' field", { field: "project" });
   }
 
   if (!goal || goal.length < 10) {
-    return errorResult(400, "REQUEST_INVALID", "Missing or invalid 'goal' field (min 10 chars)", {
-      request_id: requestId,
-    });
+    return failPlan(400, E_INTERNAL, "Missing or invalid 'goal' field (min 10 chars)", { field: "goal" });
   }
 
   if (goal.length > 20_000 || context.length > 50_000) {
-    return errorResult(400, "REQUEST_INVALID", "goal/context too large", { request_id: requestId });
+    return failPlan(400, E_INTERNAL, "goal/context too large", { field: "goal_or_context_size" });
   }
 
-  const runId = makeRunId();
+  const policyDecision = resolvePolicyDecision();
+  if (!policyDecision.ok) {
+    return failPlan(409, E_POLICY_DISALLOWED_TUPLE, policyDecision.reason, {
+      requested: policyDecision.requested,
+      allowed_tuples: policyDecision.allowed_tuples,
+    });
+  }
+
+  const effectiveEngine = policyDecision.effective.engine;
+  const effectiveModel = policyDecision.effective.model;
+
   const projectSlug = slugify(project, 80);
   updateRunStore(runId, {
     run_id: runId,
-    request_id: requestId,
-    state: "received",
+    request_id: canonicalRequestId,
+    state: "running",
     project,
     project_slug: projectSlug,
     agent,
     started_at: isoNow(),
   });
+  logEvent("plan.received", {
+    request_id: canonicalRequestId,
+    run_id: runId,
+    workspace: null,
+    project,
+    duration_ms: 0,
+    agent,
+    goal_length: goal.length,
+    context_length: context.length,
+  });
 
-  if (requestId) {
-    state.requestInFlight.set(requestId, runId);
+  if (providedRequestId) {
+    state.requestInFlight.set(providedRequestId, runId);
   }
   state.activeRuns.set(runId, {
     run_id: runId,
-    request_id: requestId,
+    request_id: canonicalRequestId,
     project,
     agent,
     started_at: startedAt,
@@ -992,96 +1282,129 @@ async function handlePlan(body) {
 
   let locks = [];
   let artifactsPath = null;
+  let workspacePath = null;
 
   try {
     const preflight = await getPreflight();
     if (!preflight.ok) {
-      return errorResult(503, "DEPENDENCY_UNAVAILABLE", "Preflight checks failed", {
-        request_id: requestId,
-        run_id: runId,
-        details: { errors: preflight.errors },
-      });
+      return failPlan(
+        503,
+        E_PREFLIGHT_FAILED,
+        "Preflight checks failed",
+        {
+          state: preflight.state,
+          fatal_errors: preflight.fatal_errors,
+          checks: preflight.checks,
+        },
+        null,
+        true,
+      );
     }
 
     let workspaceMap;
     try {
       workspaceMap = loadWorkspaceMap();
     } catch (err) {
-      return errorResult(503, "DEPENDENCY_UNAVAILABLE", "Workspace map unavailable", {
-        request_id: requestId,
-        run_id: runId,
-        details: { cause: String(err.message || err) },
-      });
-    }
-
-    let workspacePath;
-    try {
-      workspacePath = workspaceForAgent(agent, workspaceMap);
-    } catch (err) {
-      return errorResult(422, "UNKNOWN_AGENT_ALIAS", String(err.message || err), {
-        request_id: requestId,
-        run_id: runId,
-      });
-    }
-
-    const thinkingVerifiability = buildThinkingVerifiability(preflight);
-    if (CONFIG.strict && thinkingVerifiability === "UNVERIFIABLE" && !CONFIG.allowUnverifiableThinking) {
-      return errorResult(
-        409,
-        "THINKING_POLICY_UNVERIFIABLE",
-        "Thinking policy cannot be verified under strict mode",
-        { request_id: requestId, run_id: runId },
+      return failPlan(
+        503,
+        E_PREFLIGHT_FAILED,
+        "Workspace map unavailable",
+        { cause: String(err.message || err) },
+        null,
+        true,
       );
     }
 
+    try {
+      workspacePath = workspaceForAgent(agent, workspaceMap);
+    } catch (err) {
+      return failPlan(422, E_POLICY_DISALLOWED_TUPLE, String(err.message || err), {
+        agent,
+        cause: String(err.message || err),
+      });
+    }
+
+    const thinkingVerifiability = buildThinkingVerifiability(preflight, effectiveEngine, effectiveModel);
+    if (CONFIG.strict && thinkingVerifiability === "UNVERIFIABLE" && !CONFIG.allowUnverifiableThinking) {
+      return failPlan(
+        409,
+        E_POLICY_NO_AUTO_IN_STRICT,
+        "Thinking policy cannot be verified under strict mode",
+        {},
+        workspacePath,
+      );
+    }
+
+    const lockStartedAt = Date.now();
     const lockResult = acquireRunLocks(agent, projectSlug, runId);
+    const lockDurationMs = Date.now() - lockStartedAt;
     if (!lockResult.ok) {
-      return errorResult(409, "RUN_BUSY", "Run lock is busy", {
-        request_id: requestId,
+      state.metrics.lock_contention_total += 1;
+      logEvent("lock.acquire", {
+        request_id: canonicalRequestId,
         run_id: runId,
-        retryable: true,
+        workspace: workspacePath,
+        project,
+        duration_ms: lockDurationMs,
+        status: "contention",
         lock_scope: lockResult.lock_scope,
         locked_by_run_id: lockResult.holder?.run_id || null,
       });
+      return failPlan(
+        409,
+        E_LOCK_CONTENDED,
+        "Run lock is busy",
+        {
+          lock_scope: lockResult.lock_scope,
+          locked_by_run_id: lockResult.holder?.run_id || null,
+        },
+        workspacePath,
+        true,
+      );
     }
     locks = lockResult.locks;
+    logEvent("lock.acquire", {
+      request_id: canonicalRequestId,
+      run_id: runId,
+      workspace: workspacePath,
+      project,
+      duration_ms: lockDurationMs,
+      status: "ok",
+      lock_scope: "all",
+      scopes: locks.map((lock) => lock.scope),
+    });
 
-    updateRunStore(runId, { state: "validated", workspace_path: workspacePath });
+    updateRunStore(runId, { workspace_path: workspacePath });
 
     const invocation = resolveOracleInvocation();
     if (!invocation) {
-      return errorResult(503, "DEPENDENCY_UNAVAILABLE", "Oracle invocation unavailable", {
-        request_id: requestId,
-        run_id: runId,
-      });
-    }
-
-    if (CONFIG.strict && invocation.source === "npx") {
-      return errorResult(409, "CONFIG_NOT_SATISFIABLE", "Strict mode forbids npx Oracle fallback", {
-        request_id: requestId,
-        run_id: runId,
-      });
+      return failPlan(503, E_ORACLE_NOT_FOUND, "Oracle invocation unavailable", {}, workspacePath, true);
     }
 
     const paths = buildRunPaths(workspacePath, projectSlug, runId);
     artifactsPath = paths.finalDir;
 
     if (!CONFIG.saveArtifacts && !CONFIG.allowNoArtifacts) {
-      return errorResult(500, "ARTIFACT_PERSIST_FAILED", "Artifacts are required by policy", {
-        request_id: requestId,
-        run_id: runId,
-      });
+      return failPlan(
+        500,
+        E_INTERNAL,
+        "Artifacts are required by policy",
+        { cause: "artifacts_required_by_policy" },
+        workspacePath,
+      );
     }
 
     if (CONFIG.saveArtifacts) {
       try {
         ensureDir(paths.tmpDir, 0o700);
       } catch (err) {
-        return errorResult(500, "ARTIFACT_PERSIST_FAILED", "Failed to initialize artifact directory", {
-          request_id: requestId,
-          run_id: runId,
-          details: { cause: String(err.message || err) },
-        });
+        return failPlan(
+          500,
+          E_INTERNAL,
+          "Failed to initialize artifact directory",
+          { cause: String(err.message || err) },
+          workspacePath,
+        );
       }
     }
 
@@ -1091,6 +1414,9 @@ async function handlePlan(body) {
       strict: CONFIG.strict,
       engine_target: CONFIG.engineTarget,
       model_target: CONFIG.modelTarget,
+      effective_engine: effectiveEngine,
+      effective_model: effectiveModel,
+      tuple_fallback_applied: policyDecision.fallback_applied,
       thinking_policy: CONFIG.thinkingPolicy,
       thinking_verifiability: thinkingVerifiability,
       oracle_timeout_ms: CONFIG.oracleTimeoutMs,
@@ -1102,122 +1428,123 @@ async function handlePlan(body) {
     };
 
     if (CONFIG.saveArtifacts) {
-      writeFileAtomic(
-        join(paths.tmpDir, "request.json"),
-        `${JSON.stringify(
-          {
-            agent,
-            project,
-            goal: redactSecrets(goal),
-            context: redactSecrets(context),
-            request_id: requestId || null,
-            received_at: isoNow(),
-          },
-          null,
-          2,
-        )}\n`,
-      );
-      writeFileAtomic(
-        join(paths.tmpDir, "effective_config.json"),
-        `${JSON.stringify(effectiveConfig, null, 2)}\n`,
-      );
-      writeFileAtomic(
-        join(paths.tmpDir, "oracle_cmd.json"),
-        `${JSON.stringify(
-          {
-            command: invocation.command,
-            args: [
-              ...invocation.prefixArgs,
-              "--prompt",
-              "<redacted_prompt>",
-              "--model",
-              CONFIG.modelTarget,
-              "--engine",
-              CONFIG.engineTarget,
-              "--wait",
-            ],
-            cwd: workspacePath,
-            timeout_ms: CONFIG.oracleTimeoutMs,
-            env_keys: Array.from(ORACLE_ENV_ALLOWLIST).sort(),
-          },
-          null,
-          2,
-        )}\n`,
-      );
+      writeRedactedJsonArtifact(join(paths.tmpDir, "request.json"), {
+        agent,
+        project,
+        goal,
+        context,
+        request_id: canonicalRequestId,
+        received_at: isoNow(),
+      });
+      writeRedactedJsonArtifact(join(paths.tmpDir, "effective_config.json"), effectiveConfig);
     }
 
     updateRunStore(runId, { state: "running" });
-    logEvent("plan_run_started", {
+    logEvent("run.started", {
       run_id: runId,
-      request_id: requestId || null,
-      agent,
+      request_id: canonicalRequestId,
+      workspace: workspacePath,
       project,
+      duration_ms: Date.now() - startedAt,
+      agent,
       goal_length: goal.length,
-      effective_engine: CONFIG.engineTarget,
-      effective_model: CONFIG.modelTarget,
+      effective_engine: effectiveEngine,
+      effective_model: effectiveModel,
       thinking_verifiability: thinkingVerifiability,
       workspace_path: workspacePath,
     });
 
-    const oracle = await runOracle({ prompt, workspacePath, invocation });
+    const oracleStartedAt = Date.now();
+    logEvent("oracle.spawned", {
+      run_id: runId,
+      request_id: canonicalRequestId,
+      workspace: workspacePath,
+      project,
+      duration_ms: Date.now() - startedAt,
+      oracle_path: invocation.command,
+      oracle_source: invocation.source,
+    });
+    const oracle = await runOracle({ runId, prompt, workspacePath, invocation, effectiveEngine, effectiveModel });
+    const oracleDurationMs = Date.now() - oracleStartedAt;
     const durationMs = Date.now() - startedAt;
 
-    const successBody = {
-      ok: true,
-      status: "done",
-      run_id: runId,
-      request_id: requestId || null,
-      agent,
-      workspace_path: workspacePath,
-      artifacts_path: artifactsPath,
-      effective_engine: CONFIG.engineTarget,
-      effective_model: CONFIG.modelTarget,
-      effective_thinking_policy: CONFIG.thinkingPolicy,
-      thinking_verifiability: thinkingVerifiability,
-      duration_ms: durationMs,
-      project,
-      goal,
-      plan: oracle.stdout,
-      message: "Plan generated. Use 'decompose' palette command to convert to beads.",
-    };
-
     let result;
-
-    if (oracle.timedOut) {
-      result = errorResult(504, "ORACLE_TIMEOUT", "Oracle planning timed out", {
-        retryable: true,
-        run_id: runId,
-        request_id: requestId,
-        workspace_path: workspacePath,
-        artifacts_path: artifactsPath,
-      });
-    } else if (!oracle.ok) {
-      result = errorResult(503, "DEPENDENCY_UNAVAILABLE", "Oracle planning failed", {
-        run_id: runId,
-        request_id: requestId,
-        workspace_path: workspacePath,
-        artifacts_path: artifactsPath,
+    if (!oracle.ok) {
+      const oracleFailureCode =
+        oracle.errorCode === E_ORACLE_TIMEOUT
+          ? E_ORACLE_TIMEOUT
+          : oracle.errorCode === E_ORACLE_NOT_FOUND
+            ? E_ORACLE_NOT_FOUND
+            : oracle.errorCode === E_ORACLE_EXIT_NONZERO
+              ? E_ORACLE_EXIT_NONZERO
+              : E_ORACLE_EXIT_NONZERO;
+      const httpStatus = oracleFailureCode === E_ORACLE_TIMEOUT ? 504 : 503;
+      const errorMessage =
+        oracleFailureCode === E_ORACLE_TIMEOUT
+          ? "Oracle planning timed out"
+          : oracleFailureCode === E_ORACLE_EXIT_NONZERO
+            ? "Oracle planning exited with non-zero status"
+            : oracleFailureCode === E_ORACLE_NOT_FOUND
+              ? "Oracle invocation unavailable"
+              : "Oracle planning failed to spawn";
+      if (oracleFailureCode === E_ORACLE_TIMEOUT) {
+        state.metrics.oracle_timeouts_total += 1;
+        logEvent("oracle.timeout", {
+          run_id: runId,
+          request_id: canonicalRequestId,
+          workspace: workspacePath,
+          project,
+          duration_ms: oracleDurationMs,
+        });
+      }
+      result = errorResult(httpStatus, oracleFailureCode, errorMessage, {
+        request_id: canonicalRequestId,
+        retryable: oracleFailureCode === E_ORACLE_TIMEOUT,
         details: {
+          run_id: runId,
+          workspace_path: workspacePath,
+          artifacts_path: artifactsPath,
           oracle_exit_code: oracle.code,
           oracle_signal: oracle.signal,
           stderr: oracle.stderr.slice(0, 2000),
         },
       });
     } else {
-      result = { status: 200, body: successBody };
+      result = successResult(
+        200,
+        {
+          run_id: runId,
+          state: "done",
+        },
+        canonicalRequestId,
+      );
     }
 
+    const startedAtIso = new Date(startedAt).toISOString();
+    const finishedAtIso = isoNow();
+    const runState = result.body.ok ? "done" : "failed";
+    const errorCode = result.body.ok ? null : errorCodeOf(result.body) || E_INTERNAL;
     const meta = {
       run_id: runId,
-      request_id: requestId || null,
+      request_id: canonicalRequestId,
       agent,
       project,
+      workspace: workspacePath,
       workspace_path: workspacePath,
       artifacts_path: artifactsPath,
-      started_at: new Date(startedAt).toISOString(),
-      finished_at: isoNow(),
+      state: runState,
+      status: runState,
+      engine: effectiveEngine,
+      model: effectiveModel,
+      timestamps: {
+        started_at: startedAtIso,
+        finished_at: finishedAtIso,
+        duration_ms: durationMs,
+      },
+      started_at: startedAtIso,
+      finished_at: finishedAtIso,
       duration_ms: durationMs,
-      status: result.body.ok ? "done" : "failed",
+      error_code: errorCode,
       oracle: {
         path: invocation.command,
         version: preflight.oracle.version,
@@ -1225,78 +1552,99 @@ async function handlePlan(body) {
         signal: oracle.signal,
         timed_out: oracle.timedOut,
       },
-      effective_engine: CONFIG.engineTarget,
-      effective_model: CONFIG.modelTarget,
+      effective_engine: effectiveEngine,
+      effective_model: effectiveModel,
       effective_thinking_policy: CONFIG.thinkingPolicy,
       thinking_verifiability: thinkingVerifiability,
-      error: result.body.ok
-        ? null
-        : {
-            code: result.body.code,
-            message: result.body.message,
-            retryable: result.body.retryable,
-          },
+      error: errorCode
+        ? {
+            code: errorCode,
+            message: errorMessageOf(result.body),
+            retryable: errorRetryableOf(result.body),
+          }
+        : null,
     };
 
     if (CONFIG.saveArtifacts) {
       try {
-        writeFileAtomic(join(paths.tmpDir, "oracle_stdout.txt"), `${oracle.stdout}\n`);
-        writeFileAtomic(join(paths.tmpDir, "oracle_stderr.txt"), `${oracle.stderr}\n`);
-        writeFileAtomic(join(paths.tmpDir, "response.json"), `${JSON.stringify(result.body, null, 2)}\n`);
-        writeFileAtomic(join(paths.tmpDir, "meta.json"), `${JSON.stringify(meta, null, 2)}\n`);
+        const persistedStdout = redactSecrets(oracle.stdout);
+        const persistedStderr = redactSecrets(oracle.stderr);
+        const persistedResponse = redactForPersistence(result.body);
+        const persistedMeta = redactForPersistence(meta);
+        const persistedOracleInvocation = redactForPersistence(oracle.invocation);
+
+        writeFileAtomic(join(paths.tmpDir, "stdout.log"), `${persistedStdout}\n`);
+        writeFileAtomic(join(paths.tmpDir, "stderr.log"), `${persistedStderr}\n`);
+        writeFileAtomic(
+          join(paths.tmpDir, "oracle_cmd.json"),
+          `${JSON.stringify(persistedOracleInvocation, null, 2)}\n`,
+        );
+        // Backwards-compatible legacy names.
+        writeFileAtomic(join(paths.tmpDir, "oracle_stdout.txt"), `${persistedStdout}\n`);
+        writeFileAtomic(join(paths.tmpDir, "oracle_stderr.txt"), `${persistedStderr}\n`);
+        writeFileAtomic(join(paths.tmpDir, "response.json"), `${JSON.stringify(persistedResponse, null, 2)}\n`);
+        writeFileAtomic(join(paths.tmpDir, "meta.json"), `${JSON.stringify(persistedMeta, null, 2)}\n`);
         if (result.body.ok) {
-          writeFileAtomic(join(paths.tmpDir, "plan.md"), `${oracle.stdout}\n`);
+          writeFileAtomic(join(paths.tmpDir, "plan.md"), `${persistedStdout}\n`);
         }
+        assertRequiredArtifacts(paths.tmpDir);
         ensureDir(paths.baseDir, 0o700);
         renameSync(paths.tmpDir, paths.finalDir);
 
         if (result.body.ok) {
           ensureDir(paths.latestDir, 0o700);
-          writeFileAtomic(join(paths.latestDir, `${projectSlug}.md`), `${oracle.stdout}\n`);
+          writeFileAtomic(join(paths.latestDir, `${projectSlug}.md`), `${persistedStdout}\n`);
         }
 
-        const indexRecord = {
-          ts: isoNow(),
-          run_id: runId,
-          request_id: requestId || null,
-          agent,
-          project,
-          project_slug: projectSlug,
-          workspace_path: workspacePath,
-          artifacts_path: paths.finalDir,
-          status: result.body.ok ? "done" : "failed",
-          code: result.body.code || null,
-          duration_ms: durationMs,
-          effective_engine: CONFIG.engineTarget,
-          effective_model: CONFIG.modelTarget,
-          thinking_verifiability: thinkingVerifiability,
-        };
-
-        appendJsonl(paths.workspaceIndexPath, indexRecord);
-        appendJsonl(CONFIG.indexPath, indexRecord);
+        appendJsonl(paths.workspaceIndexPath, persistedMeta);
+        appendJsonl(CONFIG.indexPath, persistedMeta);
       } catch (err) {
-        const persistError = errorResult(
-          500,
-          "ARTIFACT_PERSIST_FAILED",
-          "Failed to persist run artifacts",
-          {
+        const persistError = errorResult(500, E_INTERNAL, "Failed to persist run artifacts", {
+          request_id: canonicalRequestId,
+          details: {
             run_id: runId,
-            request_id: requestId,
-            details: { cause: String(err.message || err) },
+            cause: String(err.message || err),
           },
-        );
+        });
         updateRunStore(runId, {
           state: "failed",
           finished_at: isoNow(),
           error: persistError.body,
           artifacts_path: artifactsPath,
         });
-        return persistError;
+        const errorCode = errorCodeOf(persistError.body) || E_INTERNAL;
+        state.metrics.total += 1;
+        state.metrics.failed += 1;
+        incrementErrorCode(errorCode);
+        observeRunDuration(durationMs);
+        safePushRecent({
+          ts: isoNow(),
+          run_id: runId,
+          request_id: canonicalRequestId,
+          project,
+          status: "failed",
+          code: errorCode,
+          duration_ms: durationMs,
+        });
+        logEvent("run.failed", {
+          run_id: runId,
+          request_id: canonicalRequestId,
+          workspace: workspacePath,
+          project,
+          duration_ms: durationMs,
+          code: errorCode,
+          http_status: persistError.status,
+          artifacts_path: artifactsPath,
+        });
+        if (providedRequestId) {
+          persistRequestCache(providedRequestId, runId, persistError.status, persistError.body);
+        }
+        return finalizePlanResult(persistError);
       }
     }
 
     updateRunStore(runId, {
-      state: result.body.ok ? "done" : "failed",
+      state: runState,
       finished_at: isoNow(),
       artifacts_path: artifactsPath,
       response: result.body,
@@ -1308,38 +1656,42 @@ async function handlePlan(body) {
       state.metrics.success += 1;
     } else {
       state.metrics.failed += 1;
-      incrementErrorCode(result.body.code || "UNKNOWN");
+      incrementErrorCode(errorCode || E_INTERNAL);
     }
+    observeRunDuration(durationMs);
 
     safePushRecent({
       ts: isoNow(),
       run_id: runId,
-      request_id: requestId || null,
+      request_id: canonicalRequestId,
       project,
-      status: result.body.ok ? "done" : "failed",
-      code: result.body.code || null,
+      status: runState,
+      code: errorCode,
       duration_ms: durationMs,
     });
 
-    logEvent("plan_run_finished", {
+    logEvent(result.body.ok ? "run.completed" : "run.failed", {
       run_id: runId,
-      request_id: requestId || null,
+      request_id: canonicalRequestId,
+      workspace: workspacePath,
       project,
-      status: result.body.ok ? "done" : "failed",
-      code: result.body.code || null,
+      status: runState,
+      code: errorCode,
       duration_ms: durationMs,
       oracle_exit_code: oracle.code,
       artifacts_path: artifactsPath,
     });
 
-    if (requestId) {
-      persistRequestCache(requestId, runId, result.status, result.body);
+    if (providedRequestId) {
+      persistRequestCache(providedRequestId, runId, result.status, result.body);
     }
 
-    return result;
+    return finalizePlanResult(result);
+  } catch (err) {
+    return failPlan(500, E_INTERNAL, String(err.message || err), { cause: String(err.message || err) }, workspacePath);
   } finally {
-    if (requestId) {
-      state.requestInFlight.delete(requestId);
+    if (providedRequestId) {
+      state.requestInFlight.delete(providedRequestId);
     }
     state.activeRuns.delete(runId);
     if (locks.length > 0) {
@@ -1347,78 +1699,165 @@ async function handlePlan(body) {
     }
   }
 }
-
 async function handleHealth() {
   const preflight = await getPreflight();
-  const body = serviceStatusBody(preflight);
-  return {
-    status: preflight.ok ? 200 : 503,
-    body,
-  };
+  const requestId = normalizeRequestId();
+  if (!preflight.ok) {
+    return errorResult(503, E_PREFLIGHT_FAILED, "Preflight checks failed", {
+      request_id: requestId,
+      retryable: true,
+      details: {
+        state: preflight.state,
+        fatal_errors: preflight.fatal_errors,
+      },
+    });
+  }
+  return successResult(200, { state: preflight.state }, requestId);
 }
 
 async function handleServiceStatus() {
   const preflight = await getPreflight();
-  return {
-    status: preflight.ok ? 200 : 503,
-    body: serviceStatusBody(preflight),
-  };
+  const requestId = normalizeRequestId();
+  if (!preflight.ok) {
+    return errorResult(503, E_PREFLIGHT_FAILED, "Preflight checks failed", {
+      request_id: requestId,
+      retryable: true,
+      details: {
+        state: preflight.state,
+        fatal_errors: preflight.fatal_errors,
+        checks: preflight.checks,
+      },
+    });
+  }
+  return successResult(200, serviceStatusBody(preflight), requestId);
+}
+
+function handleMetrics() {
+  return successResult(200, { metrics: formatPrometheusMetrics() }, normalizeRequestId());
 }
 
 async function handleRunLookup(runId) {
   const found = state.runStore.get(runId);
   if (!found) {
-    return errorResult(404, "RUN_NOT_FOUND", "Run ID not found", { run_id: runId });
+    return errorResult(404, E_INTERNAL, "Run ID not found", {
+      request_id: normalizeRequestId(),
+      details: { run_id: runId },
+    });
   }
-  return {
-    status: 200,
-    body: {
-      ok: true,
-      ...found,
+  if (!isAllowedRunState(found.state)) {
+    return errorResult(409, E_INTERNAL, "Invalid run state", {
+      request_id: normalizeRequestId(found.request_id),
+      details: {
+        run_id: found.run_id || runId,
+        state: found.state,
+        allowed: ["running", "done", "failed"],
+      },
+    });
+  }
+  return successResult(
+    200,
+    {
+      run_id: found.run_id || runId,
+      state: found.state,
     },
-  };
+    normalizeRequestId(found.request_id),
+  );
+}
+
+function aprErrorResult(requestId, command, result) {
+  return errorResult(500, E_INTERNAL, "APR command failed", {
+    request_id: requestId,
+    retryable: true,
+    details: {
+      command,
+      exit_code: result.code,
+      stderr: String(result.stderr || "").slice(0, 2_000),
+    },
+  });
+}
+
+function aprSuccessResult(requestId, command, result) {
+  return successResult(
+    200,
+    {
+      command,
+      exit_code: result.code,
+      stdout: result.stdout,
+      stderr: result.stderr,
+    },
+    requestId,
+  );
+}
+
+async function runAprRoute({ command, args, timeoutMs, requestId }) {
+  const result = await runApr(args, timeoutMs);
+  if (!result.ok) {
+    return aprErrorResult(requestId, command, result);
+  }
+  return aprSuccessResult(requestId, command, result);
+}
+
+function routeRequestId(body) {
+  if (body && typeof body.request_id === "string" && body.request_id.trim()) {
+    return normalizeRequestId(body.request_id);
+  }
+  return normalizeRequestId();
+}
+
+const INVALID_ROUND_DETAILS = Object.freeze({ field: "round" });
+
+function invalidRoundError(requestId, message) {
+  return errorResult(400, E_INTERNAL, message, {
+    request_id: requestId,
+    details: INVALID_ROUND_DETAILS,
+  });
 }
 
 const routes = {
   async run(body) {
+    const requestId = routeRequestId(body);
     const round = validateRound(body.round);
-    if (!round) return errorResult(400, "REQUEST_INVALID", "Invalid round (1-100)");
+    if (!round) return invalidRoundError(requestId, "Invalid round (1-100)");
 
     const args = ["run", String(round), "--wait"];
     if (body.include_impl) args.push("--include-impl");
     if (body.workflow) args.push("-w", String(body.workflow).slice(0, 50));
 
-    const result = await runApr(args);
-    return { status: result.ok ? 200 : 500, body: result };
+    return runAprRoute({ command: "run", args, requestId });
   },
 
   async show(body) {
+    const requestId = routeRequestId(body);
     const round = validateRound(body.round);
-    if (!round) return errorResult(400, "REQUEST_INVALID", "Invalid round");
+    if (!round) return invalidRoundError(requestId, "Invalid round");
 
     const args = ["show", String(round)];
     if (body.workflow) args.push("-w", String(body.workflow).slice(0, 50));
 
-    const result = await runApr(args, 30_000);
-    return { status: result.ok ? 200 : 500, body: result };
+    return runAprRoute({ command: "show", args, timeoutMs: 30_000, requestId });
   },
 
   async aprStatus() {
-    const result = await runApr(["status"], 30_000);
-    return { status: result.ok ? 200 : 500, body: result };
+    return runAprRoute({
+      command: "status",
+      args: ["status"],
+      timeoutMs: 30_000,
+      requestId: normalizeRequestId(),
+    });
   },
 
   async stats(body) {
+    const requestId = routeRequestId(body);
     const args = ["stats"];
     if (body?.workflow) args.push("-w", String(body.workflow).slice(0, 50));
 
-    const result = await runApr(args, 30_000);
-    return { status: result.ok ? 200 : 500, body: result };
+    return runAprRoute({ command: "stats", args, timeoutMs: 30_000, requestId });
   },
 
   async diff(body) {
+    const requestId = routeRequestId(body);
     const round = validateRound(body.round);
-    if (!round) return errorResult(400, "REQUEST_INVALID", "Invalid round");
+    if (!round) return invalidRoundError(requestId, "Invalid round");
 
     const args = ["diff", String(round)];
     if (body.round2) {
@@ -1427,24 +1866,27 @@ const routes = {
     }
     if (body.workflow) args.push("-w", String(body.workflow).slice(0, 50));
 
-    const result = await runApr(args, 30_000);
-    return { status: result.ok ? 200 : 500, body: result };
+    return runAprRoute({ command: "diff", args, timeoutMs: 30_000, requestId });
   },
 
   async history() {
-    const result = await runApr(["history"], 30_000);
-    return { status: result.ok ? 200 : 500, body: result };
+    return runAprRoute({
+      command: "history",
+      args: ["history"],
+      timeoutMs: 30_000,
+      requestId: normalizeRequestId(),
+    });
   },
 
   async integrate(body) {
+    const requestId = routeRequestId(body);
     const round = validateRound(body.round);
-    if (!round) return errorResult(400, "REQUEST_INVALID", "Invalid round");
+    if (!round) return invalidRoundError(requestId, "Invalid round");
 
     const args = ["integrate", String(round)];
     if (body.workflow) args.push("-w", String(body.workflow).slice(0, 50));
 
-    const result = await runApr(args, 30_000);
-    return { status: result.ok ? 200 : 500, body: result };
+    return runAprRoute({ command: "integrate", args, timeoutMs: 30_000, requestId });
   },
 
   async plan(body) {
@@ -1458,6 +1900,10 @@ const routes = {
   async serviceStatus() {
     return handleServiceStatus();
   },
+
+  async metrics() {
+    return handleMetrics();
+  },
 };
 
 bootstrapWorkspaceMap();
@@ -1470,10 +1916,18 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
   const path = url.pathname;
   const method = req.method || "GET";
+  const requestId = normalizeRequestId(req.headers["x-request-id"]);
 
   if (path !== "/health" && !checkAuth(req, CONFIG.token)) {
-    const out = errorResult(401, "AUTH_INVALID", "Unauthorized. Set Authorization: Bearer <token>");
-    jsonResponse(res, out.status, out.body);
+    const out = errorResult(401, E_INTERNAL, "Unauthorized. Set Authorization: Bearer <token>", {
+      request_id: requestId,
+      details: { path },
+    });
+    if (typeof out.body === "string" && out.content_type) {
+      textResponse(res, out.status, out.body, out.content_type);
+    } else {
+      jsonResponse(res, out.status, out.body);
+    }
     return;
   }
 
@@ -1490,6 +1944,8 @@ const server = createServer(async (req, res) => {
       out = await routes.health();
     } else if (method === "GET" && path === "/status") {
       out = await routes.serviceStatus();
+    } else if (method === "GET" && path === "/metrics") {
+      out = await routes.metrics();
     } else if (method === "GET" && path === "/apr-status") {
       out = await routes.aprStatus();
     } else if (method === "GET" && path === "/history") {
@@ -1507,12 +1963,22 @@ const server = createServer(async (req, res) => {
     } else if (method === "POST" && path === "/plan") {
       out = await routes.plan(await parseBody(req));
     } else {
-      out = errorResult(404, "NOT_FOUND", `Unknown endpoint: ${path}`);
+      out = errorResult(404, E_INTERNAL, `Unknown endpoint: ${path}`, {
+        request_id: requestId,
+        details: { path, method },
+      });
     }
 
-    jsonResponse(res, out.status, out.body);
+    if (typeof out.body === "string" && out.content_type) {
+      textResponse(res, out.status, out.body, out.content_type);
+    } else {
+      jsonResponse(res, out.status, out.body);
+    }
   } catch (err) {
-    const out = errorResult(500, "INTERNAL_ERROR", String(err.message || err));
+    const out = errorResult(500, E_INTERNAL, String(err.message || err), {
+      request_id: requestId,
+      details: { path, method },
+    });
     jsonResponse(res, out.status, out.body);
   }
 });
@@ -1530,12 +1996,13 @@ server.listen(CONFIG.port, "0.0.0.0", async () => {
 |    GET  /health
 |    GET  /status            (service status)
 |    GET  /apr-status        (legacy APR status)
+|    GET  /metrics           (prometheus metrics)
 |    GET  /runs/:run_id
 |    POST /plan
 |    POST /run, /show, /diff, /integrate
 |    GET  /stats, /history
 +--------------------------------------------------------------+
-|  Preflight: ${preflight.ok ? "OK" : "FAIL"}
+|  Preflight: ${preflight.state}
 +--------------------------------------------------------------+
 `);
 });
