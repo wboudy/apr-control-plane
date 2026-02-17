@@ -16,5 +16,5 @@ jobs:
         with:
           node-version-file: .nvmrc
 
-      - name: Run Smoke
-        run: bash scripts/smoke.sh
+      - name: Run Tests
+        run: npm test

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PORT="${SMOKE_PORT:-19444}"
+PORT="${SMOKE_PORT:-$((20000 + RANDOM % 20000))}"
 TOKEN="${SMOKE_TOKEN:-smoke-token}"
 TMP_DIR="$(mktemp -d -t apr-trigger-smoke-XXXXXX)"
 WORKSPACE="$TMP_DIR/workspace"
@@ -72,7 +72,7 @@ fi
 
 HEALTH_JSON="$TMP_DIR/health.json"
 curl -sS "http://127.0.0.1:$PORT/health" > "$HEALTH_JSON"
-jq -e '.service == "apr-trigger" and .oracle.available == true and .defaults.model == "gpt-5.2-pro"' "$HEALTH_JSON" >/dev/null
+jq -e '.ok == true and .state == "OK"' "$HEALTH_JSON" >/dev/null
 
 PLAN_JSON="$TMP_DIR/plan.json"
 curl -sS -X POST "http://127.0.0.1:$PORT/plan" \
@@ -81,8 +81,16 @@ curl -sS -X POST "http://127.0.0.1:$PORT/plan" \
   -d '{"agent":"smoke-agent","project":"smokeproj","goal":"Create a concise deterministic smoke plan.","context":"smoke","request_id":"smoke-req-1"}' \
   > "$PLAN_JSON"
 
-jq -e '.ok == true and (.run_id|length>0) and (.artifacts_path|length>0)' "$PLAN_JSON" >/dev/null
-ART_PATH="$(jq -r '.artifacts_path' "$PLAN_JSON")"
+jq -e '.ok == true and (.run_id|length>0) and .state == "done"' "$PLAN_JSON" >/dev/null
+RUN_ID="$(jq -r '.run_id' "$PLAN_JSON")"
+RUN_JSON="$TMP_DIR/run.json"
+curl -sS "http://127.0.0.1:$PORT/runs/$RUN_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  > "$RUN_JSON"
+jq -e --arg run_id "$RUN_ID" \
+  '.ok == true and .run_id == $run_id and (.state == "done" or .state == "failed")' \
+  "$RUN_JSON" >/dev/null
+ART_PATH="$(jq -r --arg run_id "$RUN_ID" 'select(.run_id == $run_id) | .artifacts_path' "$INDEX_PATH" | tail -n 1)"
 for f in request.json effective_config.json oracle_cmd.json oracle_stdout.txt oracle_stderr.txt response.json meta.json plan.md; do
   test -f "$ART_PATH/$f"
 done
@@ -103,7 +111,7 @@ curl -sS -X POST "http://127.0.0.1:$PORT/plan" \
   -d '{"agent":"smoke-agent","project":"sameproj","goal":"Create a deterministic plan for lock testing.","context":"smoke second","request_id":"smoke-lock-2"}' > "$SECOND_CONC"
 wait "$PID_A"
 
-jq -e '.ok == false and .code == "RUN_BUSY"' "$SECOND_CONC" >/dev/null
+jq -e '.ok == false and .error.code == "E_LOCK_CONTENDED"' "$SECOND_CONC" >/dev/null
 
 IDEM_FIRST="$TMP_DIR/idem.first.json"
 IDEM_SECOND="$TMP_DIR/idem.second.json"
