@@ -113,6 +113,36 @@ export function writeRunArtifact(paths, filename, content) {
   writeFileDurable(join(paths.tmpDir, filename), content, 0o600);
 }
 
+export async function appendJsonlWithLock({
+  lockManager,
+  path,
+  obj,
+  owner = {},
+  timeoutMs = 5_000,
+  retryDelayMs = 25,
+}) {
+  const lockResult = await lockManager.acquire(
+    { scope: "index", key: path },
+    owner,
+    { timeoutMs, retryDelayMs },
+  );
+
+  if (!lockResult.ok) {
+    const err = new Error(`Index lock unavailable for ${path}`);
+    err.code = lockResult.code || E_LOCK_INTERNAL;
+    err.retryable = Boolean(lockResult.retryable);
+    err.holder = lockResult.holder || null;
+    err.resource = lockResult.resource || { scope: "index", key: path };
+    throw err;
+  }
+
+  try {
+    appendJsonl(path, obj);
+  } finally {
+    lockManager.release(lockResult.lock);
+  }
+}
+
 function buildLatestRecord(indexRecord) {
   return {
     run_id: indexRecord.run_id,

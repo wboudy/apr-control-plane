@@ -77,7 +77,7 @@ if [[ "$HEALTH_HTTP" != "503" ]]; then
   cat "$HEALTH_JSON" >&2 || true
   exit 1
 fi
-jq -e '.ok == false and .state == "FAIL"' "$HEALTH_JSON" >/dev/null
+jq -e '.ok == false and .error.code == "E_PREFLIGHT_FAILED" and .error.details.state == "FAIL"' "$HEALTH_JSON" >/dev/null
 
 PLAN_JSON="$TMP_DIR/plan.json"
 PLAN_HTTP="$(curl -sS -o "$PLAN_JSON" -w "%{http_code}" -X POST "http://127.0.0.1:$PORT/plan" \

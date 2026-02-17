@@ -30,6 +30,7 @@ import {
   runOracleInvocation,
 } from "./lib/oracle.mjs";
 import {
+  appendJsonlWithLock,
   buildRunPaths,
   commitRunArtifacts,
   initializeRunTempDir,
@@ -42,6 +43,7 @@ import {
   errorResult,
   errorRetryableOf,
   normalizeRequestId,
+  successEnvelope,
   successResult,
 } from "./lib/envelope.mjs";
 import {
@@ -803,39 +805,6 @@ function releaseLocks(locks) {
   lockManager.releaseMany(locks || []);
 }
 
-async function appendJsonl(path, obj, runId) {
-  ensureDir(dirname(path), 0o700);
-  const lockResult = await lockManager.acquire(
-    { scope: "index", key: path },
-    {
-      run_id: runId || null,
-      operation: "append_jsonl",
-      index_path: path,
-    },
-    { timeoutMs: 5_000, retryDelayMs: 25 },
-  );
-  if (!lockResult.ok) {
-    const err = new Error(`Index lock unavailable for ${path}`);
-    err.code = lockResult.code || E_LOCK_INTERNAL;
-    err.retryable = Boolean(lockResult.retryable);
-    err.holder = lockResult.holder || null;
-    err.resource = lockResult.resource || { scope: "index", key: path };
-    throw err;
-  }
-
-  try {
-    const fd = openSync(path, "a", 0o600);
-    try {
-      writeFileSync(fd, `${JSON.stringify(obj)}\n`);
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-  } finally {
-    lockManager.release(lockResult.lock);
-  }
-}
-
 function loadRequestCache() {
   if (!existsSync(CONFIG.requestIndexPath)) return;
   const lines = readFileSync(CONFIG.requestIndexPath, "utf8").split(/\r?\n/).filter(Boolean);
@@ -870,7 +839,16 @@ async function persistRequestCache(requestId, runId, status, responseBody) {
     run_id: runId,
     saved_at: record.saved_at,
   });
-  await appendJsonl(CONFIG.requestIndexPath, record, runId);
+  await appendJsonlWithLock({
+    lockManager,
+    path: CONFIG.requestIndexPath,
+    obj: record,
+    owner: {
+      run_id: runId || null,
+      operation: "append_jsonl",
+      index_path: CONFIG.requestIndexPath,
+    },
+  });
 }
 
 function recoverAllWorkspaceTempRuns() {
@@ -1686,20 +1664,41 @@ async function handlePlan(body) {
 }
 async function handleHealth() {
   const preflight = await getPreflight();
+  const requestId = normalizeRequestId();
+  if (!preflight.ok) {
+    return errorResult(503, E_PREFLIGHT_FAILED, "Preflight checks failed", {
+      request_id: requestId,
+      retryable: true,
+      details: {
+        state: preflight.state,
+        fatal_errors: preflight.fatal_errors,
+        checks: preflight.checks,
+      },
+    });
+  }
   return {
-    status: preflight.ok ? 200 : 503,
-    body: {
-      ok: preflight.ok,
-      state: preflight.state,
-    },
+    status: 200,
+    body: successEnvelope({ state: preflight.state }, requestId),
   };
 }
 
 async function handleServiceStatus() {
   const preflight = await getPreflight();
+  const requestId = normalizeRequestId();
+  if (!preflight.ok) {
+    return errorResult(503, E_PREFLIGHT_FAILED, "Preflight checks failed", {
+      request_id: requestId,
+      retryable: true,
+      details: {
+        state: preflight.state,
+        fatal_errors: preflight.fatal_errors,
+        checks: preflight.checks,
+      },
+    });
+  }
   return {
-    status: preflight.ok ? 200 : 503,
-    body: serviceStatusBody(preflight),
+    status: 200,
+    body: successEnvelope(serviceStatusBody(preflight), requestId),
   };
 }
 
