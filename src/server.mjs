@@ -17,6 +17,7 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -53,14 +54,6 @@ import { assertRunState, isAllowedRunState } from "./lib/run-state.mjs";
 const SERVICE_NAME = "apr-trigger";
 const SERVICE_VERSION = "2.1.0";
 const SERVICE_STARTED_AT_MS = Date.now();
-const REQUIRED_RUN_ARTIFACTS = Object.freeze([
-  "meta.json",
-  "request.json",
-  "effective_config.json",
-  "oracle_cmd.json",
-  "stdout.log",
-  "stderr.log",
-]);
 const SENSITIVE_KEY_RE =
   /(?:^|[_-])(authorization|token|tokens|cookie|cookies|secret|secrets|api[_-]?key|password|passwd)(?:$|[_-])/i;
 
@@ -88,10 +81,6 @@ function expandHome(value) {
 
 function isoNow() {
   return new Date().toISOString();
-}
-
-function compactTimestamp(date = new Date()) {
-  return date.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
 }
 
 function hashString(input) {
@@ -240,14 +229,6 @@ function writeFileAtomic(path, content, mode = 0o600) {
 function writeRedactedJsonArtifact(path, value) {
   const redacted = redactForPersistence(value);
   writeFileAtomic(path, `${JSON.stringify(redacted, null, 2)}\n`);
-}
-
-function assertRequiredArtifacts(path) {
-  for (const fileName of REQUIRED_RUN_ARTIFACTS) {
-    if (!existsSync(join(path, fileName))) {
-      throw new Error(`Missing required artifact: ${fileName}`);
-    }
-  }
 }
 
 function readJsonFile(path) {
@@ -869,29 +850,25 @@ function releaseLocks(locks) {
   }
 }
 
-function acquireRunLocks(agent, projectSlug, runId) {
-  const locks = [];
-
-  const lockPlan = [
-    { scope: "global", key: "global", slots: CONFIG.maxConcurrentGlobal },
-    { scope: "workspace", key: agent, slots: CONFIG.maxConcurrentPerWorkspace },
-    { scope: "project", key: `${agent}_${projectSlug}`, slots: CONFIG.maxConcurrentPerProject },
-  ];
-
-  for (const spec of lockPlan) {
-    const result = acquireScopedLock(spec.scope, spec.key, spec.slots, runId);
-    if (!result.ok) {
-      releaseLocks(locks);
-      return {
-        ok: false,
-        lock_scope: spec.scope,
-        holder: result.holder || null,
-      };
-    }
-    locks.push(result.lock);
+function acquireRunLocks(workspacePath, projectSlug, runId) {
+  const lockKey = `${resolve(workspacePath)}::${projectSlug}`;
+  // Lock ordering rule: if this expands to multiple run-scoped locks, acquire by "<scope>:<key>"
+  // lexicographic order; current behavior acquires a single workspace+project lock.
+  const result = acquireScopedLock("workspace_project", lockKey, 1, runId);
+  if (!result.ok) {
+    return {
+      ok: false,
+      lock_scope: "workspace+project",
+      lock_key: lockKey,
+      holder: result.holder || null,
+    };
   }
-
-  return { ok: true, locks };
+  return {
+    ok: true,
+    lock_scope: "workspace+project",
+    lock_key: lockKey,
+    locks: [result.lock],
+  };
 }
 
 function appendJsonl(path, obj) {
@@ -949,6 +926,72 @@ function persistRequestCache(requestId, runId, status, responseBody) {
     saved_at: record.saved_at,
   });
   appendJsonl(CONFIG.requestIndexPath, record);
+}
+
+function recoverAllWorkspaceTempRuns() {
+  let workspaceMap = {};
+  try {
+    workspaceMap = loadWorkspaceMap();
+  } catch {
+    return;
+  }
+
+  for (const [agent, rawPath] of Object.entries(workspaceMap)) {
+    if (typeof rawPath !== "string" || !rawPath.trim()) continue;
+    const workspacePath = resolve(expandHome(rawPath));
+    const runsDir = join(workspacePath, CONFIG.planSubdir, "runs");
+    if (!existsSync(runsDir)) continue;
+    let entries = [];
+    try {
+      entries = readdirSync(runsDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !entry.name.startsWith("tmp.")) continue;
+      const runId = entry.name.slice("tmp.".length) || "unknown";
+      const quarantineName = `quarantine.${runId}.${Date.now()}.${process.pid}`;
+      const fromPath = join(runsDir, entry.name);
+      const toPath = join(runsDir, quarantineName);
+      try {
+        renameSync(fromPath, toPath);
+        writeFileAtomic(
+          join(toPath, "recovery.json"),
+          `${JSON.stringify(
+            {
+              recovered_at: isoNow(),
+              action: "quarantined",
+              reason: "startup_recovery_tmp_dir",
+              run_id: runId,
+              source_dir: entry.name,
+              quarantine_dir: quarantineName,
+            },
+            null,
+            2,
+          )}\n`,
+        );
+        logEvent("run.recovered_tmp", {
+          request_id: null,
+          run_id: runId,
+          workspace: workspacePath,
+          project: null,
+          duration_ms: 0,
+          agent,
+          quarantine_dir: quarantineName,
+        });
+      } catch (err) {
+        logEvent("run.recovery_failed", {
+          request_id: null,
+          run_id: runId,
+          workspace: workspacePath,
+          project: null,
+          duration_ms: 0,
+          agent,
+          error: String(err.message || err),
+        });
+      }
+    }
+  }
 }
 
 function makeRunId() {
@@ -1101,16 +1144,17 @@ function validateRound(round) {
 }
 
 function buildRunPaths(workspacePath, projectSlug, runId) {
-  const day = isoNow().slice(0, 10);
-  const baseDir = join(workspacePath, CONFIG.planSubdir, day);
-  const runName = `${compactTimestamp()}_${projectSlug}_${runId}`;
-  const finalDir = join(baseDir, runName);
+  void projectSlug;
+  const planRoot = join(workspacePath, CONFIG.planSubdir);
+  const runsDir = join(planRoot, "runs");
+  const finalDir = join(runsDir, runId);
   return {
-    baseDir,
+    planRoot,
+    runsDir,
     finalDir,
-    tmpDir: `${finalDir}.tmp`,
-    latestDir: join(workspacePath, CONFIG.planSubdir, "latest"),
-    workspaceIndexPath: join(workspacePath, CONFIG.planSubdir, "index.jsonl"),
+    tmpDir: join(runsDir, `tmp.${runId}`),
+    latestPath: join(planRoot, "latest.json"),
+    workspaceIndexPath: join(planRoot, "index.jsonl"),
   };
 }
 
@@ -1336,7 +1380,7 @@ async function handlePlan(body) {
     }
 
     const lockStartedAt = Date.now();
-    const lockResult = acquireRunLocks(agent, projectSlug, runId);
+    const lockResult = acquireRunLocks(workspacePath, projectSlug, runId);
     const lockDurationMs = Date.now() - lockStartedAt;
     if (!lockResult.ok) {
       state.metrics.lock_contention_total += 1;
@@ -1348,6 +1392,7 @@ async function handlePlan(body) {
         duration_ms: lockDurationMs,
         status: "contention",
         lock_scope: lockResult.lock_scope,
+        lock_key: lockResult.lock_key,
         locked_by_run_id: lockResult.holder?.run_id || null,
       });
       return failPlan(
@@ -1356,6 +1401,7 @@ async function handlePlan(body) {
         "Run lock is busy",
         {
           lock_scope: lockResult.lock_scope,
+          lock_key: lockResult.lock_key,
           locked_by_run_id: lockResult.holder?.run_id || null,
         },
         workspacePath,
@@ -1370,7 +1416,8 @@ async function handlePlan(body) {
       project,
       duration_ms: lockDurationMs,
       status: "ok",
-      lock_scope: "all",
+      lock_scope: lockResult.lock_scope,
+      lock_key: lockResult.lock_key,
       scopes: locks.map((lock) => lock.scope),
     });
 
@@ -1396,7 +1443,14 @@ async function handlePlan(body) {
 
     if (CONFIG.saveArtifacts) {
       try {
-        ensureDir(paths.tmpDir, 0o700);
+        ensureDir(paths.runsDir, 0o700);
+        if (existsSync(paths.tmpDir)) {
+          rmSync(paths.tmpDir, { recursive: true, force: true });
+        }
+        if (existsSync(paths.finalDir)) {
+          throw new Error(`Final run directory already exists: ${paths.finalDir}`);
+        }
+        mkdirSync(paths.tmpDir, { recursive: false, mode: 0o700 });
       } catch (err) {
         return failPlan(
           500,
@@ -1525,10 +1579,12 @@ async function handlePlan(body) {
     const runState = result.body.ok ? "done" : "failed";
     const errorCode = result.body.ok ? null : errorCodeOf(result.body) || E_INTERNAL;
     const meta = {
+      ts: finishedAtIso,
       run_id: runId,
       request_id: canonicalRequestId,
       agent,
       project,
+      project_slug: projectSlug,
       workspace: workspacePath,
       workspace_path: workspacePath,
       artifacts_path: artifactsPath,
@@ -1587,17 +1643,37 @@ async function handlePlan(body) {
         if (result.body.ok) {
           writeFileAtomic(join(paths.tmpDir, "plan.md"), `${persistedStdout}\n`);
         }
-        assertRequiredArtifacts(paths.tmpDir);
-        ensureDir(paths.baseDir, 0o700);
         renameSync(paths.tmpDir, paths.finalDir);
-
-        if (result.body.ok) {
-          ensureDir(paths.latestDir, 0o700);
-          writeFileAtomic(join(paths.latestDir, `${projectSlug}.md`), `${persistedStdout}\n`);
-        }
 
         appendJsonl(paths.workspaceIndexPath, persistedMeta);
         appendJsonl(CONFIG.indexPath, persistedMeta);
+        const latestLock = acquireScopedLock("latest", `${workspacePath}_${projectSlug}`, 1, runId);
+        if (!latestLock.ok) {
+          throw new Error("Latest lock unavailable");
+        }
+        try {
+          writeFileAtomic(
+            paths.latestPath,
+            `${JSON.stringify(
+              {
+                run_id: runId,
+                request_id: canonicalRequestId,
+                project,
+                project_slug: projectSlug,
+                agent,
+                workspace_path: workspacePath,
+                artifacts_path: paths.finalDir,
+                status: runState,
+                code: errorCode,
+                updated_at: finishedAtIso,
+              },
+              null,
+              2,
+            )}\n`,
+          );
+        } finally {
+          releaseLocks([latestLock.lock]);
+        }
       } catch (err) {
         const persistError = errorResult(500, E_INTERNAL, "Failed to persist run artifacts", {
           request_id: canonicalRequestId,
@@ -1897,6 +1973,7 @@ ensureDir(CONFIG.lockDir, 0o700);
 ensureDir(dirname(CONFIG.indexPath), 0o700);
 ensureDir(dirname(CONFIG.requestIndexPath), 0o700);
 loadRequestCache();
+recoverAllWorkspaceTempRuns();
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
