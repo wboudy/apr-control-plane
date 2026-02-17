@@ -1287,20 +1287,6 @@ async function handlePlan(body) {
   try {
     const preflight = await getPreflight();
     if (!preflight.ok) {
-      if (preflight.oracle?.error_code === E_ORACLE_NOT_FOUND) {
-        return failPlan(
-          503,
-          E_ORACLE_NOT_FOUND,
-          "Oracle invocation unavailable",
-          {
-            state: preflight.state,
-            fatal_errors: preflight.fatal_errors,
-            checks: preflight.checks,
-          },
-          null,
-          false,
-        );
-      }
       return failPlan(
         503,
         E_PREFLIGHT_FAILED,
@@ -1715,35 +1701,21 @@ async function handlePlan(body) {
 }
 async function handleHealth() {
   const preflight = await getPreflight();
-  const requestId = normalizeRequestId();
-  if (!preflight.ok) {
-    return errorResult(503, E_PREFLIGHT_FAILED, "Preflight checks failed", {
-      request_id: requestId,
-      retryable: true,
-      details: {
-        state: preflight.state,
-        fatal_errors: preflight.fatal_errors,
-      },
-    });
-  }
-  return successResult(200, { state: preflight.state }, requestId);
+  return {
+    status: preflight.ok ? 200 : 503,
+    body: {
+      ok: preflight.ok,
+      state: preflight.state,
+    },
+  };
 }
 
 async function handleServiceStatus() {
   const preflight = await getPreflight();
-  const requestId = normalizeRequestId();
-  if (!preflight.ok) {
-    return errorResult(503, E_PREFLIGHT_FAILED, "Preflight checks failed", {
-      request_id: requestId,
-      retryable: true,
-      details: {
-        state: preflight.state,
-        fatal_errors: preflight.fatal_errors,
-        checks: preflight.checks,
-      },
-    });
-  }
-  return successResult(200, serviceStatusBody(preflight), requestId);
+  return {
+    status: preflight.ok ? 200 : 503,
+    body: serviceStatusBody(preflight),
+  };
 }
 
 function handleMetrics() {
