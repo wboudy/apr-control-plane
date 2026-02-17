@@ -255,6 +255,29 @@ test("invalid oracle path returns E_ORACLE_NOT_FOUND", async () => {
   }
 });
 
+test("invalid cwd returns E_ORACLE_SPAWN_FAILED", async () => {
+  const result = await runOracleInvocation({
+    runId: "run-invalid-cwd",
+    argv: buildOracleArgv({
+      oraclePath: ORACLE_FIXTURE,
+      prompt: "invalid cwd",
+      model: "gpt-5.2-pro",
+      engine: "browser",
+    }),
+    cwd: "relative/path",
+    env: {
+      ...process.env,
+      PATH: process.env.PATH || "",
+      HOME: process.env.HOME || "",
+      TERM: "dumb",
+      NO_COLOR: "1",
+    },
+    timeoutMs: 2_000,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.errorCode, "E_ORACLE_SPAWN_FAILED");
+});
+
 test("timeout returns E_ORACLE_TIMEOUT and persists invocation metadata", async () => {
   const ctx = await startServer({ oracleTimeoutMs: 1_000 });
   try {

@@ -43,6 +43,7 @@ import {
   E_LOCK_CONTENDED,
   E_ORACLE_EXIT_NONZERO,
   E_ORACLE_NOT_FOUND,
+  E_ORACLE_SPAWN_FAILED,
   E_ORACLE_TIMEOUT,
   E_POLICY_DISALLOWED_TUPLE,
   E_POLICY_NO_AUTO_IN_STRICT,
@@ -693,7 +694,7 @@ async function runPreflightChecks() {
     checks.oracle_path.ok = true;
     const probe = await probeOracleVersion(invocation);
     if (!probe.ok) {
-      result.oracle.error_code = E_ORACLE_EXIT_NONZERO;
+      result.oracle.error_code = E_ORACLE_SPAWN_FAILED;
       warnings.push(`Oracle version probe failed: ${probe.raw || `exit ${String(probe.code)}`}`);
     } else {
       result.oracle.available = true;
@@ -1491,7 +1492,7 @@ async function handlePlan(body) {
             ? E_ORACLE_NOT_FOUND
             : oracle.errorCode === E_ORACLE_EXIT_NONZERO
               ? E_ORACLE_EXIT_NONZERO
-              : E_ORACLE_EXIT_NONZERO;
+              : E_ORACLE_SPAWN_FAILED;
       const httpStatus = oracleFailureCode === E_ORACLE_TIMEOUT ? 504 : 503;
       const errorMessage =
         oracleFailureCode === E_ORACLE_TIMEOUT
