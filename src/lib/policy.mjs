@@ -1,3 +1,5 @@
+import { E_POLICY_DISALLOWED_TUPLE } from "./errors.mjs";
+
 const DEFAULT_ALLOWED_TUPLES = Object.freeze([{ engine: "browser", model: "gpt-5.2-pro" }]);
 
 function normalizeValue(value) {
@@ -42,7 +44,7 @@ function tupleAllowed(allowedTuples, engine, model) {
 function reject(reason, requested, allowedTuples) {
   return {
     ok: false,
-    code: "E_POLICY_DISALLOWED_TUPLE",
+    code: E_POLICY_DISALLOWED_TUPLE,
     reason,
     requested,
     effective: null,

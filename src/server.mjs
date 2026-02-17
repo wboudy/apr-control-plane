@@ -1287,6 +1287,20 @@ async function handlePlan(body) {
   try {
     const preflight = await getPreflight();
     if (!preflight.ok) {
+      if (preflight.oracle?.error_code === E_ORACLE_NOT_FOUND) {
+        return failPlan(
+          503,
+          E_ORACLE_NOT_FOUND,
+          "Oracle invocation unavailable",
+          {
+            state: preflight.state,
+            fatal_errors: preflight.fatal_errors,
+            checks: preflight.checks,
+          },
+          null,
+          false,
+        );
+      }
       return failPlan(
         503,
         E_PREFLIGHT_FAILED,
