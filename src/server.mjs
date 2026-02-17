@@ -4,11 +4,10 @@
 
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { randomUUID, createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import {
   accessSync,
-  appendFileSync,
   chmodSync,
   closeSync,
   constants,
@@ -17,20 +16,26 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
-  readdirSync,
   readFileSync,
   renameSync,
-  rmSync,
   statfsSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { createLockManager } from "./lib/locks.mjs";
 import { parseAllowedTuples, resolveEngineModelPolicy } from "./lib/policy.mjs";
 import {
   buildOracleArgv,
   runOracleInvocation,
 } from "./lib/oracle.mjs";
+import {
+  buildRunPaths,
+  commitRunArtifacts,
+  initializeRunTempDir,
+  recoverTemporaryRunDirs,
+  writeRunArtifact,
+} from "./lib/persist.mjs";
 import {
   errorCodeOf,
   errorMessageOf,
@@ -42,11 +47,13 @@ import {
 import {
   E_INTERNAL,
   E_LOCK_CONTENDED,
+  E_LOCK_INTERNAL,
   E_ORACLE_EXIT_NONZERO,
   E_ORACLE_NOT_FOUND,
+  E_ORACLE_SPAWN_FAILED,
   E_ORACLE_TIMEOUT,
   E_POLICY_DISALLOWED_TUPLE,
-  E_POLICY_NO_AUTO_IN_STRICT,
+  E_POLICY_THINKING_UNVERIFIABLE,
   E_PREFLIGHT_FAILED,
 } from "./lib/errors.mjs";
 import { assertRunState, isAllowedRunState } from "./lib/run-state.mjs";
@@ -81,10 +88,6 @@ function expandHome(value) {
 
 function isoNow() {
   return new Date().toISOString();
-}
-
-function hashString(input) {
-  return createHash("sha1").update(String(input)).digest("hex").slice(0, 16);
 }
 
 function slugify(value, maxLen = 64) {
@@ -226,11 +229,6 @@ function writeFileAtomic(path, content, mode = 0o600) {
   }
 }
 
-function writeRedactedJsonArtifact(path, value) {
-  const redacted = redactForPersistence(value);
-  writeFileAtomic(path, `${JSON.stringify(redacted, null, 2)}\n`);
-}
-
 function readJsonFile(path) {
   const raw = readFileSync(path, "utf8");
   return JSON.parse(raw);
@@ -311,9 +309,15 @@ const CONFIG = {
 };
 
 const LOCK_STALE_MS = Math.max(CONFIG.oracleTimeoutMs + 5 * 60 * 1000, 30 * 60 * 1000);
+const LOCK_RETRY_DELAY_MS = 25;
+const LOCK_TIMEOUT_MS = 0;
 const MAX_ROUND = 100;
 const BASE_ENV = { PATH: RUNTIME_PATH, HOME: homedir(), TERM: "dumb", NO_COLOR: "1" };
 const RUN_DURATION_BUCKETS_MS = [250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 60_000, 120_000, 300_000];
+const lockManager = createLockManager({
+  lockDir: CONFIG.lockDir,
+  staleMs: LOCK_STALE_MS,
+});
 
 const ORACLE_ENV_ALLOWLIST = new Set([
   "HOME",
@@ -674,7 +678,7 @@ async function runPreflightChecks() {
     checks.oracle_path.ok = true;
     const probe = await probeOracleVersion(invocation);
     if (!probe.ok) {
-      result.oracle.error_code = E_ORACLE_EXIT_NONZERO;
+      result.oracle.error_code = probe.code === -1 ? E_ORACLE_SPAWN_FAILED : E_ORACLE_EXIT_NONZERO;
       warnings.push(`Oracle version probe failed: ${probe.raw || `exit ${String(probe.code)}`}`);
     } else {
       result.oracle.available = true;
@@ -761,105 +765,29 @@ async function getPreflight(force = false) {
   return computed;
 }
 
-function pidAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function readLockMetadata(path) {
-  try {
-    return JSON.parse(readFileSync(path, "utf8"));
-  } catch {
-    return null;
-  }
-}
-
-function isStaleLock(metadata) {
-  if (!metadata || typeof metadata !== "object") return true;
-  if (!Number.isFinite(metadata.created_at_ms)) return true;
-  if (Date.now() - metadata.created_at_ms > LOCK_STALE_MS) return true;
-  if (Number.isInteger(metadata.pid) && !pidAlive(metadata.pid)) return true;
-  return false;
-}
-
-function acquireScopedLock(scope, key, maxSlots, runId) {
-  ensureDir(CONFIG.lockDir, 0o700);
-  const safeScope = slugify(scope, 40);
-  const safeKey = slugify(key, 80);
-  let firstHolder = null;
-
-  for (let slot = 0; slot < maxSlots; slot += 1) {
-    const lockPath = join(CONFIG.lockDir, `${safeScope}_${safeKey}_${slot}.lock`);
-    try {
-      const fd = openSync(lockPath, "wx", 0o600);
-      const payload = {
-        run_id: runId,
-        scope: safeScope,
-        key: safeKey,
-        slot,
-        pid: process.pid,
-        created_at: isoNow(),
-        created_at_ms: Date.now(),
-      };
-      try {
-        writeFileSync(fd, JSON.stringify(payload));
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
-      }
-      return { ok: true, lock: { path: lockPath, scope: safeScope, key: safeKey, slot } };
-    } catch (err) {
-      if (err?.code !== "EEXIST") {
-        return { ok: false, error: String(err.message || err), scope: safeScope };
-      }
-
-      const metadata = readLockMetadata(lockPath);
-      if (!firstHolder && metadata) firstHolder = metadata;
-
-      if (isStaleLock(metadata)) {
-        try {
-          unlinkSync(lockPath);
-          slot -= 1;
-          continue;
-        } catch {
-          // Another process may own it now; keep scanning.
-        }
-      }
-    }
-  }
-
-  return {
-    ok: false,
-    scope: safeScope,
-    holder: firstHolder,
-  };
-}
-
-function releaseLocks(locks) {
-  for (const lock of locks.slice().reverse()) {
-    try {
-      unlinkSync(lock.path);
-    } catch {
-      // Best effort only.
-    }
-  }
-}
-
-function acquireRunLocks(workspacePath, projectSlug, runId) {
+async function acquireRunLocks(workspacePath, projectSlug, runId) {
   const lockKey = `${resolve(workspacePath)}::${projectSlug}`;
-  // Lock ordering rule: if this expands to multiple run-scoped locks, acquire by "<scope>:<key>"
-  // lexicographic order; current behavior acquires a single workspace+project lock.
-  const result = acquireScopedLock("workspace_project", lockKey, 1, runId);
+  const result = await lockManager.acquireMany(
+    [{ scope: "workspace_project", key: lockKey }],
+    {
+      run_id: runId,
+      workspace_path: workspacePath,
+      project_slug: projectSlug,
+      operation: "plan_run",
+    },
+    {
+      timeoutMs: LOCK_TIMEOUT_MS,
+      retryDelayMs: LOCK_RETRY_DELAY_MS,
+    },
+  );
   if (!result.ok) {
     return {
       ok: false,
+      code: result.code || E_LOCK_INTERNAL,
+      retryable: Boolean(result.retryable),
       lock_scope: "workspace+project",
       lock_key: lockKey,
+      resource: result.resource || { scope: "workspace_project", key: lockKey },
       holder: result.holder || null,
     };
   }
@@ -867,27 +795,44 @@ function acquireRunLocks(workspacePath, projectSlug, runId) {
     ok: true,
     lock_scope: "workspace+project",
     lock_key: lockKey,
-    locks: [result.lock],
+    locks: result.locks,
   };
 }
 
-function appendJsonl(path, obj) {
+function releaseLocks(locks) {
+  lockManager.releaseMany(locks || []);
+}
+
+async function appendJsonl(path, obj, runId) {
   ensureDir(dirname(path), 0o700);
-  const lock = acquireScopedLock("index", hashString(path), 1, `index-${hashString(path)}`);
-  if (!lock.ok) {
-    throw new Error(`Index lock unavailable for ${path}`);
+  const lockResult = await lockManager.acquire(
+    { scope: "index", key: path },
+    {
+      run_id: runId || null,
+      operation: "append_jsonl",
+      index_path: path,
+    },
+    { timeoutMs: 5_000, retryDelayMs: 25 },
+  );
+  if (!lockResult.ok) {
+    const err = new Error(`Index lock unavailable for ${path}`);
+    err.code = lockResult.code || E_LOCK_INTERNAL;
+    err.retryable = Boolean(lockResult.retryable);
+    err.holder = lockResult.holder || null;
+    err.resource = lockResult.resource || { scope: "index", key: path };
+    throw err;
   }
 
   try {
     const fd = openSync(path, "a", 0o600);
     try {
-      appendFileSync(fd, `${JSON.stringify(obj)}\n`);
+      writeFileSync(fd, `${JSON.stringify(obj)}\n`);
       fsyncSync(fd);
     } finally {
       closeSync(fd);
     }
   } finally {
-    releaseLocks([lock.lock]);
+    lockManager.release(lockResult.lock);
   }
 }
 
@@ -910,7 +855,7 @@ function loadRequestCache() {
   }
 }
 
-function persistRequestCache(requestId, runId, status, responseBody) {
+async function persistRequestCache(requestId, runId, status, responseBody) {
   const persistedResponse = redactForPersistence(responseBody);
   const record = {
     request_id: requestId,
@@ -925,7 +870,7 @@ function persistRequestCache(requestId, runId, status, responseBody) {
     run_id: runId,
     saved_at: record.saved_at,
   });
-  appendJsonl(CONFIG.requestIndexPath, record);
+  await appendJsonl(CONFIG.requestIndexPath, record, runId);
 }
 
 function recoverAllWorkspaceTempRuns() {
@@ -939,57 +884,29 @@ function recoverAllWorkspaceTempRuns() {
   for (const [agent, rawPath] of Object.entries(workspaceMap)) {
     if (typeof rawPath !== "string" || !rawPath.trim()) continue;
     const workspacePath = resolve(expandHome(rawPath));
-    const runsDir = join(workspacePath, CONFIG.planSubdir, "runs");
-    if (!existsSync(runsDir)) continue;
-    let entries = [];
     try {
-      entries = readdirSync(runsDir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      if (!entry.isDirectory() || !entry.name.startsWith("tmp.")) continue;
-      const runId = entry.name.slice("tmp.".length) || "unknown";
-      const quarantineName = `quarantine.${runId}.${Date.now()}.${process.pid}`;
-      const fromPath = join(runsDir, entry.name);
-      const toPath = join(runsDir, quarantineName);
-      try {
-        renameSync(fromPath, toPath);
-        writeFileAtomic(
-          join(toPath, "recovery.json"),
-          `${JSON.stringify(
-            {
-              recovered_at: isoNow(),
-              action: "quarantined",
-              reason: "startup_recovery_tmp_dir",
-              run_id: runId,
-              source_dir: entry.name,
-              quarantine_dir: quarantineName,
-            },
-            null,
-            2,
-          )}\n`,
-        );
+      const recovered = recoverTemporaryRunDirs(workspacePath, CONFIG.planSubdir);
+      for (const item of recovered) {
         logEvent("run.recovered_tmp", {
           request_id: null,
-          run_id: runId,
+          run_id: item.run_id,
           workspace: workspacePath,
           project: null,
           duration_ms: 0,
           agent,
-          quarantine_dir: quarantineName,
-        });
-      } catch (err) {
-        logEvent("run.recovery_failed", {
-          request_id: null,
-          run_id: runId,
-          workspace: workspacePath,
-          project: null,
-          duration_ms: 0,
-          agent,
-          error: String(err.message || err),
+          quarantine_dir: item.quarantine_dir,
         });
       }
+    } catch (err) {
+      logEvent("run.recovery_failed", {
+        request_id: null,
+        run_id: null,
+        workspace: workspacePath,
+        project: null,
+        duration_ms: 0,
+        agent,
+        error: String(err.message || err),
+      });
     }
   }
 }
@@ -1143,21 +1060,6 @@ function validateRound(round) {
   return n;
 }
 
-function buildRunPaths(workspacePath, projectSlug, runId) {
-  void projectSlug;
-  const planRoot = join(workspacePath, CONFIG.planSubdir);
-  const runsDir = join(planRoot, "runs");
-  const finalDir = join(runsDir, runId);
-  return {
-    planRoot,
-    runsDir,
-    finalDir,
-    tmpDir: join(runsDir, `tmp.${runId}`),
-    latestPath: join(planRoot, "latest.json"),
-    workspaceIndexPath: join(planRoot, "index.jsonl"),
-  };
-}
-
 function serviceStatusBody(preflight) {
   const uptimeMs = Math.max(0, Date.now() - SERVICE_STARTED_AT_MS);
   return {
@@ -1283,7 +1185,7 @@ async function handlePlan(body) {
 
   const policyDecision = resolvePolicyDecision();
   if (!policyDecision.ok) {
-    return failPlan(409, E_POLICY_DISALLOWED_TUPLE, policyDecision.reason, {
+    return failPlan(409, policyDecision.code || E_POLICY_DISALLOWED_TUPLE, policyDecision.reason, {
       requested: policyDecision.requested,
       allowed_tuples: policyDecision.allowed_tuples,
     });
@@ -1372,7 +1274,7 @@ async function handlePlan(body) {
     if (CONFIG.strict && thinkingVerifiability === "UNVERIFIABLE" && !CONFIG.allowUnverifiableThinking) {
       return failPlan(
         409,
-        E_POLICY_NO_AUTO_IN_STRICT,
+        E_POLICY_THINKING_UNVERIFIABLE,
         "Thinking policy cannot be verified under strict mode",
         {},
         workspacePath,
@@ -1380,32 +1282,37 @@ async function handlePlan(body) {
     }
 
     const lockStartedAt = Date.now();
-    const lockResult = acquireRunLocks(workspacePath, projectSlug, runId);
+    const lockResult = await acquireRunLocks(workspacePath, projectSlug, runId);
     const lockDurationMs = Date.now() - lockStartedAt;
     if (!lockResult.ok) {
-      state.metrics.lock_contention_total += 1;
+      if (lockResult.code === E_LOCK_CONTENDED) {
+        state.metrics.lock_contention_total += 1;
+      }
       logEvent("lock.acquire", {
         request_id: canonicalRequestId,
         run_id: runId,
         workspace: workspacePath,
         project,
         duration_ms: lockDurationMs,
-        status: "contention",
+        status: lockResult.code === E_LOCK_CONTENDED ? "contention" : "error",
         lock_scope: lockResult.lock_scope,
         lock_key: lockResult.lock_key,
+        lock_code: lockResult.code,
         locked_by_run_id: lockResult.holder?.run_id || null,
       });
       return failPlan(
-        409,
-        E_LOCK_CONTENDED,
-        "Run lock is busy",
+        lockResult.code === E_LOCK_CONTENDED ? 409 : 500,
+        lockResult.code === E_LOCK_CONTENDED ? E_LOCK_CONTENDED : E_LOCK_INTERNAL,
+        lockResult.code === E_LOCK_CONTENDED ? "Run lock is busy" : "Run lock acquisition failed",
         {
           lock_scope: lockResult.lock_scope,
           lock_key: lockResult.lock_key,
+          lock_code: lockResult.code || E_LOCK_INTERNAL,
           locked_by_run_id: lockResult.holder?.run_id || null,
+          lock_resource: lockResult.resource || null,
         },
         workspacePath,
-        true,
+        Boolean(lockResult.retryable),
       );
     }
     locks = lockResult.locks;
@@ -1428,7 +1335,7 @@ async function handlePlan(body) {
       return failPlan(503, E_ORACLE_NOT_FOUND, "Oracle invocation unavailable", {}, workspacePath, true);
     }
 
-    const paths = buildRunPaths(workspacePath, projectSlug, runId);
+    const paths = buildRunPaths(workspacePath, CONFIG.planSubdir, runId);
     artifactsPath = paths.finalDir;
 
     if (!CONFIG.saveArtifacts && !CONFIG.allowNoArtifacts) {
@@ -1443,14 +1350,7 @@ async function handlePlan(body) {
 
     if (CONFIG.saveArtifacts) {
       try {
-        ensureDir(paths.runsDir, 0o700);
-        if (existsSync(paths.tmpDir)) {
-          rmSync(paths.tmpDir, { recursive: true, force: true });
-        }
-        if (existsSync(paths.finalDir)) {
-          throw new Error(`Final run directory already exists: ${paths.finalDir}`);
-        }
-        mkdirSync(paths.tmpDir, { recursive: false, mode: 0o700 });
+        initializeRunTempDir(paths);
       } catch (err) {
         return failPlan(
           500,
@@ -1482,15 +1382,27 @@ async function handlePlan(body) {
     };
 
     if (CONFIG.saveArtifacts) {
-      writeRedactedJsonArtifact(join(paths.tmpDir, "request.json"), {
-        agent,
-        project,
-        goal,
-        context,
-        request_id: canonicalRequestId,
-        received_at: isoNow(),
-      });
-      writeRedactedJsonArtifact(join(paths.tmpDir, "effective_config.json"), effectiveConfig);
+      writeRunArtifact(
+        paths,
+        "request.json",
+        `${JSON.stringify(
+          redactForPersistence({
+            agent,
+            project,
+            goal,
+            context,
+            request_id: canonicalRequestId,
+            received_at: isoNow(),
+          }),
+          null,
+          2,
+        )}\n`,
+      );
+      writeRunArtifact(
+        paths,
+        "effective_config.json",
+        `${JSON.stringify(redactForPersistence(effectiveConfig), null, 2)}\n`,
+      );
     }
 
     updateRunStore(runId, { state: "running" });
@@ -1531,7 +1443,9 @@ async function handlePlan(body) {
             ? E_ORACLE_NOT_FOUND
             : oracle.errorCode === E_ORACLE_EXIT_NONZERO
               ? E_ORACLE_EXIT_NONZERO
-              : E_ORACLE_EXIT_NONZERO;
+              : oracle.errorCode === E_ORACLE_SPAWN_FAILED
+                ? E_ORACLE_SPAWN_FAILED
+                : E_ORACLE_SPAWN_FAILED;
       const httpStatus = oracleFailureCode === E_ORACLE_TIMEOUT ? 504 : 503;
       const errorMessage =
         oracleFailureCode === E_ORACLE_TIMEOUT
@@ -1629,57 +1543,52 @@ async function handlePlan(body) {
         const persistedMeta = redactForPersistence(meta);
         const persistedOracleInvocation = redactForPersistence(oracle.invocation);
 
-        writeFileAtomic(join(paths.tmpDir, "stdout.log"), `${persistedStdout}\n`);
-        writeFileAtomic(join(paths.tmpDir, "stderr.log"), `${persistedStderr}\n`);
-        writeFileAtomic(
-          join(paths.tmpDir, "oracle_cmd.json"),
-          `${JSON.stringify(persistedOracleInvocation, null, 2)}\n`,
-        );
+        writeRunArtifact(paths, "stdout.log", `${persistedStdout}\n`);
+        writeRunArtifact(paths, "stderr.log", `${persistedStderr}\n`);
+        writeRunArtifact(paths, "oracle_cmd.json", `${JSON.stringify(persistedOracleInvocation, null, 2)}\n`);
         // Backwards-compatible legacy names.
-        writeFileAtomic(join(paths.tmpDir, "oracle_stdout.txt"), `${persistedStdout}\n`);
-        writeFileAtomic(join(paths.tmpDir, "oracle_stderr.txt"), `${persistedStderr}\n`);
-        writeFileAtomic(join(paths.tmpDir, "response.json"), `${JSON.stringify(persistedResponse, null, 2)}\n`);
-        writeFileAtomic(join(paths.tmpDir, "meta.json"), `${JSON.stringify(persistedMeta, null, 2)}\n`);
+        writeRunArtifact(paths, "oracle_stdout.txt", `${persistedStdout}\n`);
+        writeRunArtifact(paths, "oracle_stderr.txt", `${persistedStderr}\n`);
+        writeRunArtifact(paths, "response.json", `${JSON.stringify(persistedResponse, null, 2)}\n`);
+        writeRunArtifact(paths, "meta.json", `${JSON.stringify(persistedMeta, null, 2)}\n`);
         if (result.body.ok) {
-          writeFileAtomic(join(paths.tmpDir, "plan.md"), `${persistedStdout}\n`);
+          writeRunArtifact(paths, "plan.md", `${persistedStdout}\n`);
         }
-        renameSync(paths.tmpDir, paths.finalDir);
-
-        appendJsonl(paths.workspaceIndexPath, persistedMeta);
-        appendJsonl(CONFIG.indexPath, persistedMeta);
-        const latestLock = acquireScopedLock("latest", `${workspacePath}_${projectSlug}`, 1, runId);
-        if (!latestLock.ok) {
-          throw new Error("Latest lock unavailable");
-        }
-        try {
-          writeFileAtomic(
-            paths.latestPath,
-            `${JSON.stringify(
-              {
-                run_id: runId,
-                request_id: canonicalRequestId,
-                project,
-                project_slug: projectSlug,
-                agent,
-                workspace_path: workspacePath,
-                artifacts_path: paths.finalDir,
-                status: runState,
-                code: errorCode,
-                updated_at: finishedAtIso,
-              },
-              null,
-              2,
-            )}\n`,
-          );
-        } finally {
-          releaseLocks([latestLock.lock]);
-        }
+        await commitRunArtifacts({
+          lockManager,
+          runId,
+          paths,
+          indexRecord: persistedMeta,
+          globalIndexPath: CONFIG.indexPath,
+          latestRecord: {
+            run_id: runId,
+            request_id: canonicalRequestId,
+            project,
+            project_slug: projectSlug,
+            agent,
+            workspace_path: workspacePath,
+            artifacts_path: paths.finalDir,
+            status: runState,
+            code: errorCode,
+            updated_at: finishedAtIso,
+          },
+        });
       } catch (err) {
-        const persistError = errorResult(500, E_INTERNAL, "Failed to persist run artifacts", {
+        const persistErrorCode =
+          err?.code === E_LOCK_CONTENDED
+            ? E_LOCK_CONTENDED
+            : err?.code === E_LOCK_INTERNAL
+              ? E_LOCK_INTERNAL
+              : E_INTERNAL;
+        const persistErrorStatus = persistErrorCode === E_LOCK_CONTENDED ? 409 : 500;
+        const persistError = errorResult(persistErrorStatus, persistErrorCode, "Failed to persist run artifacts", {
           request_id: canonicalRequestId,
+          retryable: Boolean(err?.retryable),
           details: {
             run_id: runId,
             cause: String(err.message || err),
+            lock_resource: err?.resource || null,
+            locked_by_run_id: err?.holder?.run_id || null,
           },
         });
         updateRunStore(runId, {
@@ -1713,7 +1622,7 @@ async function handlePlan(body) {
           artifacts_path: artifactsPath,
         });
         if (providedRequestId) {
-          persistRequestCache(providedRequestId, runId, persistError.status, persistError.body);
+          await persistRequestCache(providedRequestId, runId, persistError.status, persistError.body);
         }
         return finalizePlanResult(persistError);
       }
@@ -1759,7 +1668,7 @@ async function handlePlan(body) {
     });
 
     if (providedRequestId) {
-      persistRequestCache(providedRequestId, runId, result.status, result.body);
+      await persistRequestCache(providedRequestId, runId, result.status, result.body);
     }
 
     return finalizePlanResult(result);
@@ -1795,7 +1704,11 @@ async function handleServiceStatus() {
 }
 
 function handleMetrics() {
-  return successResult(200, { metrics: formatPrometheusMetrics() }, normalizeRequestId());
+  return {
+    status: 200,
+    body: formatPrometheusMetrics(),
+    content_type: "text/plain; version=0.0.4; charset=utf-8",
+  };
 }
 
 async function handleRunLookup(runId) {

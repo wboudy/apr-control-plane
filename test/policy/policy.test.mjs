@@ -97,7 +97,7 @@ test("strict=true + auto -> reject", () => {
   });
 
   assert.equal(result.ok, false);
-  assert.equal(result.code, "E_POLICY_DISALLOWED_TUPLE");
+  assert.equal(result.code, "E_POLICY_AUTO_FORBIDDEN");
 });
 
 test("strict=true + wrong tuple -> reject", () => {
@@ -113,6 +113,21 @@ test("strict=true + wrong tuple -> reject", () => {
 
   assert.equal(result.ok, false);
   assert.equal(result.code, "E_POLICY_DISALLOWED_TUPLE");
+});
+
+test("strict=true + missing explicit engine/model -> reject", () => {
+  const result = resolveEngineModelPolicy({
+    strict: true,
+    engine: "browser",
+    model: "gpt-5.2-pro",
+    engineExplicit: false,
+    modelExplicit: false,
+    allowFallback: false,
+    allowedTuples: parseAllowedTuples("browser:gpt-5.2-pro"),
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.code, "E_POLICY_MISSING_REQUIRED");
 });
 
 test("strict=false + fallback allowed -> accept and persist effective_config.json", async () => {

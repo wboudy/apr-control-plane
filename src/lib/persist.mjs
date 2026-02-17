@@ -12,6 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { E_LOCK_INTERNAL } from "./errors.mjs";
 
 function ensureDir(path, mode = 0o700) {
   mkdirSync(path, { recursive: true, mode });
@@ -158,7 +159,7 @@ export async function commitRunArtifacts({
 
   if (!lockResult.ok) {
     const err = new Error("Unable to acquire persistence lock(s)");
-    err.code = lockResult.code || "E_LOCK_INTERNAL";
+    err.code = lockResult.code || E_LOCK_INTERNAL;
     err.retryable = Boolean(lockResult.retryable);
     err.holder = lockResult.holder || null;
     err.resource = lockResult.resource || null;

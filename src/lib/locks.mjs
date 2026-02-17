@@ -9,6 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { E_LOCK_CONTENDED, E_LOCK_INTERNAL } from "./errors.mjs";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -115,7 +116,7 @@ function acquireOnce({ lockDir, staleMs, resource, owner }) {
       if (err?.code !== "EEXIST") {
         return {
           ok: false,
-          code: "E_LOCK_INTERNAL",
+          code: E_LOCK_INTERNAL,
           retryable: false,
           error: String(err?.message || err),
           resource: { scope: normalized.scope, key: normalized.key },
@@ -134,7 +135,7 @@ function acquireOnce({ lockDir, staleMs, resource, owner }) {
 
       return {
         ok: false,
-        code: "E_LOCK_CONTENDED",
+        code: E_LOCK_CONTENDED,
         retryable: true,
         resource: { scope: normalized.scope, key: normalized.key },
         holder: holder || null,
@@ -144,7 +145,7 @@ function acquireOnce({ lockDir, staleMs, resource, owner }) {
 
   return {
     ok: false,
-    code: "E_LOCK_CONTENDED",
+    code: E_LOCK_CONTENDED,
     retryable: true,
     resource: normalizeResource(resource),
     holder: null,
@@ -174,7 +175,7 @@ export function createLockManager({ lockDir, staleMs }) {
 
     while (true) {
       const attempt = acquireOnce({ lockDir, staleMs, resource, owner });
-      if (attempt.ok || attempt.code !== "E_LOCK_CONTENDED") return attempt;
+      if (attempt.ok || attempt.code !== E_LOCK_CONTENDED) return attempt;
       if (timeoutMs === 0) return attempt;
 
       const elapsed = Date.now() - startedAt;

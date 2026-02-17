@@ -7,6 +7,10 @@
     "start": "node src/server.mjs",
     "smoke": "bash scripts/smoke.sh",
     "test:contracts": "node --test test/contracts/*.test.mjs",
-    "test": "npm run test:contracts && bash scripts/smoke.sh"
+    "test:preflight": "bash test/preflight-health-contract.sh",
+    "test:policy": "node --test test/policy/*.test.mjs",
+    "test:oracle": "node --test test/oracle/*.test.mjs",
+    "test:concurrency": "node --test test/concurrency/*.test.mjs",
+    "test": "npm run test:contracts && bash scripts/smoke.sh && npm run test:preflight && npm run test:policy && npm run test:oracle && npm run test:concurrency"
   }
 }

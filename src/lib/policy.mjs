@@ -1,4 +1,8 @@
-import { E_POLICY_DISALLOWED_TUPLE } from "./errors.mjs";
+import {
+  E_POLICY_AUTO_FORBIDDEN,
+  E_POLICY_DISALLOWED_TUPLE,
+  E_POLICY_MISSING_REQUIRED,
+} from "./errors.mjs";
 
 const DEFAULT_ALLOWED_TUPLES = Object.freeze([{ engine: "browser", model: "gpt-5.2-pro" }]);
 
@@ -41,10 +45,10 @@ function tupleAllowed(allowedTuples, engine, model) {
   return allowedTuples.some((tuple) => tuple.engine === engine && tuple.model === model);
 }
 
-function reject(reason, requested, allowedTuples) {
+function reject(code, reason, requested, allowedTuples) {
   return {
     ok: false,
-    code: E_POLICY_DISALLOWED_TUPLE,
+    code,
     reason,
     requested,
     effective: null,
@@ -75,11 +79,16 @@ export function resolveEngineModelPolicy({
   };
 
   if (strict && (!requested.explicit.engine || !requested.explicit.model)) {
-    return reject("Strict mode requires explicit engine and model targets", requested, allowed);
+    return reject(
+      E_POLICY_MISSING_REQUIRED,
+      "Strict mode requires explicit engine and model targets",
+      requested,
+      allowed,
+    );
   }
 
   if (strict && (requested.engine === "auto" || requested.model === "auto")) {
-    return reject("Strict mode forbids auto engine/model targets", requested, allowed);
+    return reject(E_POLICY_AUTO_FORBIDDEN, "Strict mode forbids auto engine/model targets", requested, allowed);
   }
 
   if (requested.engine && requested.model && tupleAllowed(allowed, requested.engine, requested.model)) {
@@ -106,7 +115,7 @@ export function resolveEngineModelPolicy({
     };
   }
 
-  return reject("Requested engine/model tuple is not allowed by policy", requested, allowed);
+  return reject(E_POLICY_DISALLOWED_TUPLE, "Requested engine/model tuple is not allowed by policy", requested, allowed);
 }
 
 export { DEFAULT_ALLOWED_TUPLES };
